@@ -26,6 +26,7 @@ https://github.com/user-attachments/assets/359bab0f-66f1-48a2-91aa-37e0007f8dcf
 - [API Key Setup](Docs/OpenAI/setup.md#setup)
 - [Core Prefabs](Docs/OpenAI/setup.md#core-prefabs)
 - [Custom Tools Guide](Docs/OpenAI/tools.md)
+- [RAG & Vector Knowledge Base Guide](Docs/OpenAI/rag.md)
 - [Events](Docs/OpenAI/setup.md#events)
 
 **Sample Scenes**

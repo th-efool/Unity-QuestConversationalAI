@@ -1,4 +1,4 @@
-﻿# OpenAI Real-time Conversational AI - Setup
+# OpenAI Real-time Conversational AI - Setup
 
 Unity package for integrating OpenAI's real-time conversation API into your Unity projects.
 
@@ -50,6 +50,9 @@ To give your AI agent access to custom documentation, manuals, lore, or internal
 5. Open **Window -> OpenAI -> RAG Knowledge Base** to drag-and-drop documents (`.pdf`, `.docx`, `.md`, `.txt`, `.json`, `.csv`) and click **Ingest**.
 6. Attach the `RagConversationBridge` component to your `RealtimeConversationManager` GameObject.
 
+> [!NOTE]
+> For in-depth architecture, backend setup guides (including complete Supabase SQL scripts), ingestion pipelines, and C# search API examples, see the [Complete RAG & Vector Knowledge Base Guide](rag.md).
+
 ## Core Prefabs
 
 ### RealtimeConversationManager
@@ -79,6 +82,18 @@ Prefab for managing custom tools that the AI can invoke during conversations.
 1. Drag `AgentToolsBinding` prefab into your scene
 2. Assign your tool scripts to the binding component
 3. Configure tool schema JSON files
+
+### RagConversationBridge
+
+Component for connecting OpenAI Realtime conversations with vector databases for RAG knowledge retrieval.
+
+**Setup:**
+
+1. Add `RagConversationBridge` component to your `RealtimeConversationManager` GameObject
+2. Assign your `RagConfig` asset to `Rag Config`
+3. Choose retrieval mode: `AgenticToolCall` (model autonomously searches) or `ProactiveContextInjection` (auto-searches after user speaks)
+
+See the [Complete RAG & Vector Knowledge Base Guide](rag.md) for architecture, supported backends, and C# search API examples.
 
 ## Custom Tools
 
