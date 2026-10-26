@@ -1,4 +1,4 @@
-# OpenAI Real-time Conversational AI - Setup
+﻿# OpenAI Real-time Conversational AI - Setup
 
 Unity package for integrating OpenAI's real-time conversation API into your Unity projects.
 
@@ -34,6 +34,21 @@ Before installing this package, add **NativeWebSocket**:
 2. Right-click → Create → OpenAI → Config
 3. Paste your API key in the configuration asset
 4. Save the configuration
+
+### 3. (Optional) Configure Vector Database (RAG)
+
+To give your AI agent access to custom documentation, manuals, lore, or internal databases:
+
+1. In Unity, go to `Assets/Resources/`
+2. Right-click -> **Create -> OpenAI -> VectorDB Config**
+3. Select your target vector database backend:
+   - **LocalBakedAsset**: 100% offline, zero network dependencies, runs directly on Meta Quest / Android.
+   - **SupabasePgVector**: PostgreSQL with `pgvector` extension via PostgREST.
+   - **Pinecone**: Serverless vector index (supports both vector and 2026-07 document schemas).
+   - **Qdrant**: Cloud or self-hosted vector database via REST.
+4. Paste your database URI and API Key (or leave as `LocalBakedAsset` for instant zero-configuration testing).
+5. Open **Window -> OpenAI -> RAG Knowledge Base** to drag-and-drop documents (`.pdf`, `.docx`, `.md`, `.txt`, `.json`, `.csv`) and click **Ingest**.
+6. Attach the `RagConversationBridge` component to your `RealtimeConversationManager` GameObject.
 
 ## Core Prefabs
 

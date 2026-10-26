@@ -5,11 +5,10 @@ using OpenAI;
 namespace OpenAI.RAG
 {
     /// <summary>
-    /// Configuration asset for OpenAI-powered Retrieval-Augmented Generation (RAG).
-    /// Configures embeddings, vector storage backends (Local, Supabase, Pinecone, Qdrant),
-    /// retrieval parameters, and OpenAI Realtime tool definition.
+    /// Configuration asset for Vector Database & RAG knowledge retrieval.
+    /// Right-click in Assets/Resources/ -> Create -> OpenAI -> VectorDB Config
     /// </summary>
-    [CreateAssetMenu(menuName = "OpenAI/RAG/RAG Configuration", fileName = "RagConfig")]
+    [CreateAssetMenu(menuName = "OpenAI/VectorDB Config", fileName = "VectorDBConfig", order = 2)]
     public class RagConfig : ScriptableObject
     {
         [Header("OpenAI Authentication")]

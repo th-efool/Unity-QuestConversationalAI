@@ -292,10 +292,6 @@ namespace OpenAI.RAG
 
                 if (request.result != UnityWebRequest.Result.Success)
                 {
-                    if (!string.IsNullOrEmpty(responseText) && responseText.IndexOf("document schema", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        return await UpsertDocumentsAsync(chunks, baseUri, ns, apiKey);
-                    }
                     return (false, FormatHttpError(request, responseCode, responseText));
                 }
 
