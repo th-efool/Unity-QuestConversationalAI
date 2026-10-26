@@ -653,7 +653,7 @@ namespace OpenAI.RAG.Editor
                     (progress, status) =>
                     {
                         EditorUtility.DisplayProgressBar(
-                            $"Ingesting Documents ({filesProcessed} processed)",
+                            "Ingesting Documents",
                             status,
                             progress);
                     });
