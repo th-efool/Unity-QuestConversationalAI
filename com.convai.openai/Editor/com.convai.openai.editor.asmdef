@@ -1,0 +1,19 @@
+{
+    "name": "com.convai.openai.editor",
+    "rootNamespace": "OpenAI.RAG.Editor",
+    "references": [
+        "com.convai.openai",
+        "Unity.Nuget.Newtonsoft-Json"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

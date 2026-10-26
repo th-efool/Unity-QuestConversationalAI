@@ -118,6 +118,33 @@ namespace OpenAI
         /// Force stop agent
         /// Used it to cancel any interaction and close the socket immediately
         /// </summary>
+        #region Realtime commands
+
+        public void SendContextMessage(string contextText)
+        {
+            if (_ws == null || _ws.State != WebSocketState.Open || string.IsNullOrWhiteSpace(contextText)) return;
+            var item = new JObject
+            {
+                ["type"] = "conversation.item.create",
+                ["item"] = new JObject
+                {
+                    ["type"] = "message",
+                    ["role"] = "user",
+                    ["content"] = new JArray
+                    {
+                        new JObject
+                        {
+                            ["type"] = "input_text",
+                            ["text"] = $"[System Knowledge Context]:\n{contextText}"
+                        }
+                    }
+                }
+            };
+            _ = _ws.SendText(item.ToString(Formatting.None));
+        }
+
+        #endregion
+
         public void InterruptNow()
         {
             TryCancelAssistantResponse();

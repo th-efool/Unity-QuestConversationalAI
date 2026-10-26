@@ -1,9 +1,9 @@
 {
   "name": "com.convai.openai",
   "displayName": "ConversationalAI [OpenAI]",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "unity": "6000.0",
-  "description": "A Unity package that enables real-time conversational AI interactions using OpenAI's Realtime API.",
+  "description": "A Unity package that enables real-time conversational AI interactions using OpenAI's Realtime API with native RAG (Retrieval-Augmented Generation) vector database capabilities.",
   "dependencies": {
     "com.unity.nuget.newtonsoft-json": "3.0.0"
   },
