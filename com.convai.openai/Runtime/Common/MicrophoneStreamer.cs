@@ -9,6 +9,12 @@ public class MicrophoneStreamer : MonoBehaviour
 {
     public Action<string> OnAudioChunk;
 
+    /// <summary>
+    /// When true, audio position advances normally but no audio chunks are emitted over the network.
+    /// Useful for text-only testing in Editor or push-to-talk gating.
+    /// </summary>
+    public bool IsMuted { get; set; }
+
     private const int SampleRateOut   = 16_000; 
     private const int ChunkSamplesOut = 1_024;
 
@@ -42,6 +48,12 @@ public class MicrophoneStreamer : MonoBehaviour
             samplesAvailable += _microphoneClip.samples;
 
         if (samplesAvailable < _chunkSamplesIn) return;
+
+        if (IsMuted)
+        {
+            _lastSamplePos = (_lastSamplePos + _chunkSamplesIn) % _microphoneClip.samples;
+            return;
+        }
     
         var inBuf = new float[_chunkSamplesIn];
         ReadCircular(_microphoneClip, _lastSamplePos, inBuf);

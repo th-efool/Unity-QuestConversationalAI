@@ -93,7 +93,6 @@ namespace OpenAI
         /// </summary>
         public static event Func<string> OnRequestImage; 
         
-        
         /// <summary>
         /// Call this from any GameObject to start talking to the agent
         /// Normally this is called on start if `startOnAwake` is set to true
@@ -112,6 +111,106 @@ namespace OpenAI
                 Debug.LogError($"[OpenAI] Startup failed: {ex}");
                 enabled = false;
             }
+        }
+
+        public static event Action<bool> OnMicrophoneMuteChanged;
+
+        public bool IsSessionReady => _sessionReady;
+        public bool IsAgentSpeaking => _agentCurrentlySpeaking;
+        public bool IsResponseActive => _responseActive;
+        public bool IsMicrophoneMuted { get; private set; }
+
+        public void SetMicrophoneMuted(bool muted)
+        {
+            IsMicrophoneMuted = muted;
+            if (micStreamer != null)
+            {
+                micStreamer.IsMuted = muted;
+            }
+
+            try
+            {
+                OnMicrophoneMuteChanged?.Invoke(muted);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[OpenAI] OnMicrophoneMuteChanged error: {ex.Message}");
+            }
+
+            if (muted && _ws != null && _ws.State == WebSocketState.Open)
+            {
+                _ = _ws.SendText("{\"type\":\"input_audio_buffer.clear\"}");
+            }
+        }
+
+        public void RequestResponse() => SendResponseCreate(commitAudio: false);
+
+        /// <summary>
+        /// Sends a text message as a user conversation item to the Realtime API and requests a response.
+        /// The model responds with voice audio, transcript deltas, and tool calls identically to spoken input.
+        /// If the agent is currently speaking, barge-in is triggered automatically.
+        /// </summary>
+        public async void SendUserTextMessage(string userText, bool includeImageIfAvailable = true)
+        {
+            if (string.IsNullOrWhiteSpace(userText)) return;
+
+            if (_ws == null || _ws.State != WebSocketState.Open || !_sessionReady)
+            {
+                Debug.LogWarning("[OpenAI] Cannot send text message: WebSocket is not open or session is not ready.");
+                return;
+            }
+
+            // 1. Barge-in: if agent is currently speaking or has an active turn, cancel it immediately
+            if (_agentCurrentlySpeaking || _responseActive || _responseCreateSent)
+            {
+                TryCancelAssistantResponse();
+                _responseActive = false;
+                _responseCreateSent = false;
+            }
+
+            // 2. Clear any uncommitted mic audio
+            await _ws.SendText("{\"type\":\"input_audio_buffer.clear\"}");
+
+            // 3. Notify local listeners (UI logs, subtitles, RAG proactive context injection)
+            string trimmedText = userText.Trim();
+            try
+            {
+                onUserTranscript?.Invoke(trimmedText);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[OpenAI] Exception in onUserTranscript listener: {ex.Message}");
+            }
+
+            // 4. Attach image if available
+            if (includeImageIfAvailable)
+            {
+                await MaybeSendImageItemAsync();
+            }
+
+            // 5. Create user text conversation item
+            var item = new JObject
+            {
+                ["type"] = "conversation.item.create",
+                ["item"] = new JObject
+                {
+                    ["type"] = "message",
+                    ["role"] = "user",
+                    ["content"] = new JArray
+                    {
+                        new JObject
+                        {
+                            ["type"] = "input_text",
+                            ["text"] = trimmedText
+                        }
+                    }
+                }
+            };
+            await _ws.SendText(item.ToString(Formatting.None));
+
+            // 6. Request model response (pure text turn, do not commit empty audio buffer)
+            _lastCreateSentTime = 0;
+            SendResponseCreate(commitAudio: false);
         }
 
         /// <summary>
@@ -366,7 +465,7 @@ namespace OpenAI
             _ = _ws.SendText(upd.ToString(Formatting.None));
         }
 
-        private void SendResponseCreate()
+        private void SendResponseCreate(bool commitAudio = false)
         {
             if (_ws == null || _ws.State != WebSocketState.Open) return;
             if (_responseActive || _responseCreateSent) return;
@@ -377,8 +476,11 @@ namespace OpenAI
             _lastCreateSentTime = now;
             _responseCreateSent = true;
 
-            var commit = new JObject { ["type"] = "input_audio_buffer.commit" };
-            _ = _ws.SendText(commit.ToString(Formatting.None));
+            if (commitAudio)
+            {
+                var commit = new JObject { ["type"] = "input_audio_buffer.commit" };
+                _ = _ws.SendText(commit.ToString(Formatting.None));
+            }
 
             var create = new JObject { ["type"] = "response.create" };
             _ = _ws.SendText(create.ToString(Formatting.None));
@@ -628,7 +730,7 @@ namespace OpenAI
             }
 
             await MaybeSendImageItemAsync();
-            SendResponseCreate();
+            SendResponseCreate(commitAudio: false);
         }
 
         private static void HandleInputCommitted() { }
