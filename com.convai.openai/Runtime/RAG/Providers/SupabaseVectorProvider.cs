@@ -439,12 +439,13 @@ namespace OpenAI.RAG
 
         private string GetBaseRestUrl()
         {
-            if (string.IsNullOrWhiteSpace(_config?.databaseUri))
+            string dbUri = _config != null ? _config.GetEffectiveDatabaseUri() : null;
+            if (string.IsNullOrWhiteSpace(dbUri))
             {
                 return string.Empty;
             }
 
-            string uri = _config.databaseUri.Trim().TrimEnd('/');
+            string uri = dbUri.Trim().TrimEnd('/');
             if (!uri.EndsWith("/rest/v1", StringComparison.OrdinalIgnoreCase))
             {
                 uri += "/rest/v1";
@@ -455,15 +456,17 @@ namespace OpenAI.RAG
 
         private string GetTableName()
         {
-            return !string.IsNullOrWhiteSpace(_config?.collectionOrTableName)
-                ? _config.collectionOrTableName.Trim()
+            string tableName = _config != null ? _config.GetEffectiveCollectionOrTable() : null;
+            return !string.IsNullOrWhiteSpace(tableName)
+                ? tableName.Trim()
                 : "documents";
         }
 
         private string GetRpcFunctionName()
         {
-            return !string.IsNullOrWhiteSpace(_config?.supabaseRpcFunctionName)
-                ? _config.supabaseRpcFunctionName.Trim()
+            string rpc = _config != null ? _config.GetEffectiveRpcFunction() : null;
+            return !string.IsNullOrWhiteSpace(rpc)
+                ? rpc.Trim()
                 : "match_documents";
         }
 

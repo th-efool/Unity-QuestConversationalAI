@@ -76,6 +76,18 @@ namespace OpenAI.RAG
         {
             ResolveConversationManager();
 
+            if (ragConfig == null)
+            {
+                if (conversationManager != null && conversationManager.Config != null && conversationManager.Config.vectorDbConfig != null)
+                {
+                    ragConfig = conversationManager.Config.vectorDbConfig;
+                }
+                if (ragConfig == null)
+                {
+                    ragConfig = Resources.Load<RagConfig>("RagConfig") ?? Resources.Load<RagConfig>("VectorDBConfig");
+                }
+            }
+
             if (registerOnAwake && ragConfig != null)
             {
                 Register();
@@ -115,6 +127,18 @@ namespace OpenAI.RAG
         /// </summary>
         public void Register()
         {
+            if (ragConfig == null)
+            {
+                if (conversationManager != null && conversationManager.Config != null && conversationManager.Config.vectorDbConfig != null)
+                {
+                    ragConfig = conversationManager.Config.vectorDbConfig;
+                }
+                if (ragConfig == null)
+                {
+                    ragConfig = Resources.Load<RagConfig>("RagConfig") ?? Resources.Load<RagConfig>("VectorDBConfig");
+                }
+            }
+
             if (ragConfig == null)
             {
                 Debug.LogWarning("[OpenAI.RAG] Cannot register RagConversationBridge: ragConfig is null.");

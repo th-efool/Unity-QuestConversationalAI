@@ -99,6 +99,7 @@ namespace OpenAI
         /// </summary>
         public async void StartAgent()
         {
+            EnsureRagBridge();
             try
             {
                 InitializeWebSocket();
@@ -113,9 +114,32 @@ namespace OpenAI
             }
         }
 
+        private void EnsureRagBridge()
+        {
+            var bridge = GetComponent<OpenAI.RAG.RagConversationBridge>();
+            if (bridge == null)
+            {
+#if UNITY_2023_1_OR_NEWER
+                bridge = FindAnyObjectByType<OpenAI.RAG.RagConversationBridge>();
+#else
+                bridge = FindObjectOfType<OpenAI.RAG.RagConversationBridge>();
+#endif
+            }
+            if (bridge == null)
+            {
+                bridge = gameObject.AddComponent<OpenAI.RAG.RagConversationBridge>();
+            }
+            if (bridge != null && !bridge.IsRegistered)
+            {
+                bridge.ResolveConversationManager();
+                bridge.Register();
+            }
+        }
+
         public static event Action<bool> OnMicrophoneMuteChanged;
 
         public bool IsSessionReady => _sessionReady;
+        public OpenAIConfig Config => config;
         public bool IsAgentSpeaking => _agentCurrentlySpeaking;
         public bool IsResponseActive => _responseActive;
         public bool IsMicrophoneMuted { get; private set; }

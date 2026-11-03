@@ -44,6 +44,94 @@ namespace OpenAI.RAG
         [Tooltip("Runtime read/query API key for cloud vector databases (e.g. Supabase anon key, Pinecone read key). Admin/write keys can be entered safely in the Editor Window.")]
         public string runtimeApiKey = "";
 
+        [Header("Pre-Configured Cloud Vector Database Profiles")]
+        [Header("1. Qdrant Cloud")]
+        public string qdrantUrl = "https://e4aa181d-961a-4e8f-b5a5-118166e69d73.sa-east-1-0.aws.cloud.qdrant.io";
+        public string qdrantApiKey = "";
+        public string qdrantCollection = "documents";
+
+        [Header("2. Pinecone Serverless")]
+        public string pineconeIndexHost = "https://rag-provider-tests-ieyzlld.svc.aped-4627-b74a.pinecone.io";
+        public string pineconeApiKey = "";
+        public string pineconeNamespace = "rag-provider-tests";
+
+        [Header("3. Supabase pgvector")]
+        public string supabaseUrl = "https://hfiogejcvbknwhtvotfz.supabase.co";
+        public string supabaseApiKey = "sb_publishable_HqUCMWNAaBI3wa6fRCanrg_9yia5-cr";
+        public string supabaseTable = "rag_test_chunks";
+        public string supabaseRpcFunction = "match_documents";
+
+        private void OnValidate()
+        {
+            SyncActiveBackendFields();
+        }
+
+        public void SyncActiveBackendFields()
+        {
+            switch (backendType)
+            {
+                case VectorBackendType.Qdrant:
+                    if (!string.IsNullOrWhiteSpace(qdrantUrl)) databaseUri = qdrantUrl;
+                    if (!string.IsNullOrWhiteSpace(qdrantApiKey)) runtimeApiKey = qdrantApiKey;
+                    if (!string.IsNullOrWhiteSpace(qdrantCollection)) collectionOrTableName = qdrantCollection;
+                    break;
+
+                case VectorBackendType.Pinecone:
+                    if (!string.IsNullOrWhiteSpace(pineconeIndexHost)) databaseUri = pineconeIndexHost;
+                    if (!string.IsNullOrWhiteSpace(pineconeApiKey)) runtimeApiKey = pineconeApiKey;
+                    if (!string.IsNullOrWhiteSpace(pineconeNamespace)) collectionOrTableName = pineconeNamespace;
+                    break;
+
+                case VectorBackendType.SupabasePgVector:
+                    if (!string.IsNullOrWhiteSpace(supabaseUrl)) databaseUri = supabaseUrl;
+                    if (!string.IsNullOrWhiteSpace(supabaseApiKey)) runtimeApiKey = supabaseApiKey;
+                    if (!string.IsNullOrWhiteSpace(supabaseTable)) collectionOrTableName = supabaseTable;
+                    if (!string.IsNullOrWhiteSpace(supabaseRpcFunction)) supabaseRpcFunctionName = supabaseRpcFunction;
+                    break;
+            }
+        }
+
+        public string GetEffectiveDatabaseUri()
+        {
+            switch (backendType)
+            {
+                case VectorBackendType.Qdrant:
+                    if (!string.IsNullOrWhiteSpace(qdrantUrl)) return qdrantUrl;
+                    break;
+                case VectorBackendType.Pinecone:
+                    if (!string.IsNullOrWhiteSpace(pineconeIndexHost)) return pineconeIndexHost;
+                    break;
+                case VectorBackendType.SupabasePgVector:
+                    if (!string.IsNullOrWhiteSpace(supabaseUrl)) return supabaseUrl;
+                    break;
+            }
+            return databaseUri;
+        }
+
+        public string GetEffectiveCollectionOrTable()
+        {
+            switch (backendType)
+            {
+                case VectorBackendType.Qdrant:
+                    if (!string.IsNullOrWhiteSpace(qdrantCollection)) return qdrantCollection;
+                    break;
+                case VectorBackendType.Pinecone:
+                    if (!string.IsNullOrWhiteSpace(pineconeNamespace)) return pineconeNamespace;
+                    break;
+                case VectorBackendType.SupabasePgVector:
+                    if (!string.IsNullOrWhiteSpace(supabaseTable)) return supabaseTable;
+                    break;
+            }
+            return collectionOrTableName;
+        }
+
+        public string GetEffectiveRpcFunction()
+        {
+            if (backendType == VectorBackendType.SupabasePgVector && !string.IsNullOrWhiteSpace(supabaseRpcFunction))
+                return supabaseRpcFunction;
+            return supabaseRpcFunctionName;
+        }
+
         [Header("Retrieval & Search Settings")]
         [Tooltip("Method used to retrieve and supply context to the conversation.")]
         public RagRetrievalMode retrievalMode = RagRetrievalMode.AgenticToolCall;
@@ -78,9 +166,32 @@ namespace OpenAI.RAG
         public int embeddingBatchSize = 50;
 
         /// <summary>
-        /// Resolves the effective OpenAI API key from the referenced OpenAIConfig asset.
+        /// Resolves the effective OpenAI API key from the referenced OpenAIConfig asset, Resources, or environment.
         /// </summary>
-        public string EffectiveOpenAIApiKey => openAIConfig != null ? openAIConfig.apiKey : string.Empty;
+        public string EffectiveOpenAIApiKey
+        {
+            get
+            {
+                if (openAIConfig != null && !string.IsNullOrWhiteSpace(openAIConfig.apiKey))
+                {
+                    return openAIConfig.apiKey;
+                }
+
+                var loaded = Resources.Load<OpenAIConfig>("OpenAIConfig");
+                if (loaded != null && !string.IsNullOrWhiteSpace(loaded.apiKey))
+                {
+                    return loaded.apiKey;
+                }
+
+                string envKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+                if (!string.IsNullOrWhiteSpace(envKey))
+                {
+                    return envKey;
+                }
+
+                return string.Empty;
+            }
+        }
 
         /// <summary>
         /// Returns the effective API key for vector store queries (prefers runtimeApiKey, falls back to override).
@@ -88,6 +199,20 @@ namespace OpenAI.RAG
         public string GetEffectiveBackendApiKey(string overrideKey = null)
         {
             if (!string.IsNullOrEmpty(overrideKey)) return overrideKey;
+
+            switch (backendType)
+            {
+                case VectorBackendType.Qdrant:
+                    if (!string.IsNullOrWhiteSpace(qdrantApiKey)) return qdrantApiKey;
+                    break;
+                case VectorBackendType.Pinecone:
+                    if (!string.IsNullOrWhiteSpace(pineconeApiKey)) return pineconeApiKey;
+                    break;
+                case VectorBackendType.SupabasePgVector:
+                    if (!string.IsNullOrWhiteSpace(supabaseApiKey)) return supabaseApiKey;
+                    break;
+            }
+
             return runtimeApiKey;
         }
     }
