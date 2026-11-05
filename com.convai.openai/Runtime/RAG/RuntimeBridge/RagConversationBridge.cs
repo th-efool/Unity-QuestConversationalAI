@@ -276,13 +276,14 @@ namespace OpenAI.RAG
 
             try
             {
-                var results = await SearchAsync(query);
+                var results = await SearchCoreAsync(query, true);
                 results = LimitForTool(results);
                 string formattedContext = FormatContext(results);
 
                 return new JObject
                 {
                     ["ok"] = true,
+                    ["status"] = results.Count == 0 ? "no_sources" : "retrieved",
                     ["results_count"] = results.Count,
                     ["context"] = formattedContext
                 };
@@ -294,7 +295,8 @@ namespace OpenAI.RAG
                 {
                     ["ok"] = false,
                     ["results_count"] = 0,
-                    ["context"] = $"Error searching knowledge base: {ex.Message}"
+                    ["status"] = "unavailable",
+                    ["context"] = "The knowledge lookup failed. Please retry."
                 };
             }
         }
@@ -422,11 +424,14 @@ namespace OpenAI.RAG
         /// </summary>
         /// <param name="query">The text query to embed and search for.</param>
         /// <returns>A list of ranked <see cref="RagSearchResult"/> objects matching the query above the similarity threshold.</returns>
-        public async Task<List<RagSearchResult>> SearchAsync(string query)
+        public Task<List<RagSearchResult>> SearchAsync(string query) => SearchCoreAsync(query, false);
+
+        private async Task<List<RagSearchResult>> SearchCoreAsync(string query, bool reportFailure)
         {
             if (ragConfig == null)
             {
                 Debug.LogWarning("[OpenAI.RAG] SearchAsync called but ragConfig is null.");
+                if (reportFailure) throw new InvalidOperationException("[OpenAI.RAG] SearchAsync called but ragConfig is null.");
                 return new List<RagSearchResult>();
             }
 
@@ -455,6 +460,7 @@ namespace OpenAI.RAG
             if (_embeddingClient == null)
             {
                 Debug.LogError("[OpenAI.RAG] OpenAIEmbeddingClient could not be initialized.");
+                if (reportFailure) throw new InvalidOperationException("[OpenAI.RAG] OpenAIEmbeddingClient could not be initialized.");
                 return new List<RagSearchResult>();
             }
 
@@ -462,12 +468,14 @@ namespace OpenAI.RAG
             if (!string.IsNullOrEmpty(embedErr) || embedding == null)
             {
                 Debug.LogWarning($"[OpenAI.RAG] Failed to generate embedding for query '{query}': {embedErr}");
+                if (reportFailure) throw new InvalidOperationException($"[OpenAI.RAG] Failed to generate embedding for query '{query}': {embedErr}");
                 return new List<RagSearchResult>();
             }
 
             if (_provider == null)
             {
                 Debug.LogError("[OpenAI.RAG] Vector store provider could not be created.");
+                if (reportFailure) throw new InvalidOperationException("[OpenAI.RAG] Vector store provider could not be created.");
                 return new List<RagSearchResult>();
             }
 
@@ -480,6 +488,7 @@ namespace OpenAI.RAG
             if (!string.IsNullOrEmpty(queryErr))
             {
                 Debug.LogWarning($"[OpenAI.RAG] Vector store query returned error: {queryErr}");
+                if (reportFailure) throw new InvalidOperationException($"[OpenAI.RAG] Vector store query returned error: {queryErr}");
                 return new List<RagSearchResult>();
             }
 

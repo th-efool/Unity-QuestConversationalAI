@@ -51,6 +51,8 @@ namespace OpenAI
 
         [Header("Unity Events")]
         public UnityEvent<string> onAgentTranscript;
+        public event Action<string, string> AgentItemDelta;
+        public event Action<string, string, bool> AgentItemFinished;
         public UnityEvent<string> onUserTranscript;
         public UnityEvent<bool>   onUserSpeaking;
         public UnityEvent<bool>   onAgentSpeaking;
@@ -485,7 +487,7 @@ public bool IsSessionReady => _sessionReady;
                     break;
 
                 case "conversation.item.input_audio_transcription.delta":
-                    HandleInputTranscriptDelta(text);
+                    // Only completed input transcripts are conversation turns.
                     break;
 
                 case "conversation.item.input_audio_transcription.completed":
@@ -1009,16 +1011,6 @@ public bool IsSessionReady => _sessionReady;
 
         private void HandleInputCommitted() { MarkTurnStart("voice"); }
 
-        private void HandleInputTranscriptDelta(string json)
-        {
-            try
-            {
-                var jo = JObject.Parse(json);
-                var delta = jo["delta"]?.ToString();
-                if (!string.IsNullOrEmpty(delta)) onUserTranscript?.Invoke(delta);
-            } catch {}
-        }
-
         private void HandleInputTranscriptCompleted(string json)
         {
             try
@@ -1058,9 +1050,13 @@ public bool IsSessionReady => _sessionReady;
         {
             try
             {
-                var tx = JsonConvert.DeserializeObject<ResponseAudioTranscriptDelta>(json);
-                if (!string.IsNullOrEmpty(tx?.DeltaText))
-                    onAgentTranscript?.Invoke(tx.DeltaText);
+                var part = JObject.Parse(json);
+                string delta = (string)part["delta"];
+                if (!string.IsNullOrEmpty(delta))
+                {
+                    onAgentTranscript?.Invoke(delta);
+                    AgentItemDelta?.Invoke((string)part["item_id"], delta);
+                }
             } catch {}
         }
 
@@ -1119,6 +1115,18 @@ public bool IsSessionReady => _sessionReady;
             {
                 var obj  = JObject.Parse(json);
                 var item = obj["item"] as JObject;
+                if (item?.Value<string>("role") == "assistant" && item["content"] is JArray parts)
+                {
+                    var transcript = new System.Text.StringBuilder();
+                    foreach (var part in parts)
+                    {
+                        string value = (string)part["transcript"] ?? (string)part["text"];
+                        if (!string.IsNullOrWhiteSpace(value))
+                            transcript.AppendLine(value.Trim());
+                    }
+                    AgentItemFinished?.Invoke((string)item["id"], transcript.ToString().Trim(),
+                        (string)item["status"] == "incomplete");
+                }
                 if (item?["type"]?.ToString() == "function_call")
                 {
                     var callId = item["call_id"]?.ToString();
