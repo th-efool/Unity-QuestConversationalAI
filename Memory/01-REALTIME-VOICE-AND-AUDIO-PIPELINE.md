@@ -82,6 +82,6 @@ RealtimeConversationManager.StartAgent()
   - Modify `voiceSpeed`, `vadThreshold`, or `silenceDurationMs` on `RealtimeConversationManager` and call `SendSessionUpdate()`.
 
 
-### Conversation and walkthrough behavior
+### Assistant item events
 
-RealtimeConversationManager publishes assistant item-keyed preview deltas and final assistant message content for ConvoAIDebugOverlay history. Agent speaking is an audio status only. Typed submissions and completed voice transcripts publish onUserTranscript once; input deltas do not. Direct session instructions route walkthroughs to the tour tools and require explicit source/absence reporting.
+RealtimeConversationManager publishes AgentItemDelta(itemId, text) and AgentItemFinished(itemId, text, interrupted). Consumers own subscription lifecycle. Input transcription deltas do not publish onUserTranscript.

@@ -90,4 +90,4 @@ Runtime Query Execution (RagConversationBridge.ExecuteRetrieveContextAsync)
 
 ### Conversation and walkthrough behavior
 
-RagConversationBridge agent tool results distinguish retrieved, no_sources and unavailable. Existing public SearchAsync callers retain list semantics. Use a source name and section only for a claim supported by the returned passage. The direct HUD admits the existing cache-result latency line for inspection.
+RagConversationBridge agent tool results distinguish retrieved, no_sources and unavailable. Existing public SearchAsync callers retain list semantics. Use a source name and section only for a claim supported by the returned passage.
