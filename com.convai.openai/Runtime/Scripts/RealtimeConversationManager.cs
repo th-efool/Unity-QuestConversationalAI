@@ -22,6 +22,9 @@ namespace OpenAI
         [Header("Voice")]
         [SerializeField] private Voice voice = Voice.Alloy;
         [SerializeField] private string customVoice = "";
+        [Range(0.5f, 1.5f)]
+        [SerializeField] private float voiceSpeed = 1.15f;
+        public float VoiceSpeed { get => voiceSpeed; set => voiceSpeed = Mathf.Clamp(value, 0.5f, 1.5f); }
 
         [Header("System prompt")]
         [TextArea(2, 8)]
@@ -615,7 +618,8 @@ public bool IsSessionReady => _sessionReady;
                         ["output"] = new JObject
                         {
                             ["format"] = new JObject { ["type"] = "audio/pcm", ["rate"] = 24000 },
-                            ["voice"] = ResolveVoiceString()
+                            ["voice"] = ResolveVoiceString(),
+                            ["speed"] = voiceSpeed
                         }
                     },
                     ["tools"] = AgentToolRegistry.GetToolsSpec()
@@ -642,7 +646,8 @@ public bool IsSessionReady => _sessionReady;
                     ["output"] = new JObject
                     {
                         ["format"] = new JObject { ["type"] = "audio/pcm", ["rate"] = 24000 },
-                        ["voice"] = ResolveVoiceString()
+                        ["voice"] = ResolveVoiceString(),
+                        ["speed"] = voiceSpeed
                     }
                 },
                 ["tools"] = AgentToolRegistry.GetToolsSpec()
