@@ -14,7 +14,7 @@ namespace OpenAI.RAG
     /// Interacts directly with Pinecone Data Plane REST APIs using UnityWebRequest.
     /// Supports Upsert, Similarity Query with metadata, Clear/Delete, and Connection Testing.
     /// </summary>
-    public class PineconeVectorProvider : IVectorStoreProvider
+    public class PineconeVectorProvider : IVectorStoreProvider, IBulkExportProvider
     {
         private const string PineconeApiVersion = "2024-07";
 
@@ -369,6 +369,345 @@ namespace OpenAI.RAG
                     return (true, $"Pinecone connection successful (HTTP {responseCode}), but could not parse stats JSON: {ex.Message}");
                 }
             }
+        }
+
+        /// <summary>
+        /// Downloads every vector or document (metadata, text, and embedding values) from the configured Pinecone
+        /// namespace so the knowledge base can be mirrored into <see cref="RagLocalIndex"/>.
+        /// Supports both standard vector indexes (2024-07) and document-schema indexes (2026-07).
+        /// </summary>
+        public async Task<(List<DocumentChunk> chunks, string error)> ExportAllAsync(string apiKeyOverride = null)
+        {
+            var all = new List<DocumentChunk>();
+            string apiKey = ResolveApiKey(apiKeyOverride);
+            if (string.IsNullOrWhiteSpace(apiKey))
+            {
+                return (all, "Pinecone API key is missing. Set runtimeApiKey in RagConfig or provide apiKeyOverride.");
+            }
+
+            string baseUri = ResolveBaseUri(out string uriError);
+            if (!string.IsNullOrEmpty(uriError))
+            {
+                return (all, uriError);
+            }
+
+            string ns = _config != null ? _config.GetEffectiveCollectionOrTable() : string.Empty;
+            var allIds = new List<string>();
+            string nextToken = null;
+
+            for (int page = 0; page < 100; page++)
+            {
+                var sbUrl = new StringBuilder($"{baseUri}/vectors/list?limit=100");
+                if (!string.IsNullOrEmpty(ns))
+                {
+                    sbUrl.Append("&namespace=").Append(Uri.EscapeDataString(ns));
+                }
+                if (!string.IsNullOrEmpty(nextToken))
+                {
+                    sbUrl.Append("&paginationToken=").Append(Uri.EscapeDataString(nextToken));
+                }
+
+                string responseText;
+                using (var request = UnityWebRequest.Get(sbUrl.ToString()))
+                {
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Api-Key", apiKey);
+                    request.SetRequestHeader("X-Pinecone-API-Version", PineconeApiVersion);
+                    request.timeout = 30;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Pinecone list network request failed: {ex.Message}");
+                    }
+
+                    responseText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        if (!string.IsNullOrEmpty(responseText) && responseText.IndexOf("document schema", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return await ExportAllDocumentsAsync(baseUri, ns, apiKey);
+                        }
+                        return (all, FormatHttpError(request, request.responseCode, responseText));
+                    }
+                }
+
+                try
+                {
+                    var (pageIds, next) = ParseListIds(responseText);
+                    if (pageIds.Count > 0) allIds.AddRange(pageIds);
+                    nextToken = next;
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Pinecone list response: {ex.Message}");
+                }
+
+                if (string.IsNullOrEmpty(nextToken))
+                {
+                    break;
+                }
+            }
+
+            if (allIds.Count == 0)
+            {
+                return (all, null);
+            }
+
+            const int fetchBatchSize = 100;
+            for (int i = 0; i < allIds.Count; i += fetchBatchSize)
+            {
+                int count = Math.Min(fetchBatchSize, allIds.Count - i);
+                var sbFetch = new StringBuilder($"{baseUri}/vectors/fetch?");
+                if (!string.IsNullOrEmpty(ns))
+                {
+                    sbFetch.Append("namespace=").Append(Uri.EscapeDataString(ns)).Append('&');
+                }
+                for (int j = 0; j < count; j++)
+                {
+                    if (j > 0) sbFetch.Append('&');
+                    sbFetch.Append("ids=").Append(Uri.EscapeDataString(allIds[i + j]));
+                }
+
+                string fetchText;
+                using (var request = UnityWebRequest.Get(sbFetch.ToString()))
+                {
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Api-Key", apiKey);
+                    request.SetRequestHeader("X-Pinecone-API-Version", PineconeApiVersion);
+                    request.timeout = 60;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Pinecone fetch network request failed: {ex.Message}");
+                    }
+
+                    fetchText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        return (all, FormatHttpError(request, request.responseCode, fetchText));
+                    }
+                }
+
+                try
+                {
+                    var batchChunks = await Task.Run(() => ParseFetchRecords(fetchText));
+                    all.AddRange(batchChunks);
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Pinecone fetch response: {ex.Message}");
+                }
+            }
+
+            return (all, null);
+        }
+
+        private async Task<(List<DocumentChunk> chunks, string error)> ExportAllDocumentsAsync(string baseUri, string ns, string apiKey)
+        {
+            var all = new List<DocumentChunk>();
+            string listUrl = string.IsNullOrEmpty(ns)
+                ? $"{baseUri}/documents/list"
+                : $"{baseUri}/namespaces/{Uri.EscapeDataString(ns)}/documents/list";
+            string fetchUrl = string.IsNullOrEmpty(ns)
+                ? $"{baseUri}/documents/fetch"
+                : $"{baseUri}/namespaces/{Uri.EscapeDataString(ns)}/documents/fetch";
+
+            var allIds = new List<string>();
+            string nextToken = null;
+
+            for (int page = 0; page < 100; page++)
+            {
+                var listBody = new JObject { ["limit"] = 100 };
+                if (!string.IsNullOrEmpty(nextToken))
+                {
+                    listBody["pagination_token"] = nextToken;
+                }
+
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(listBody.ToString(Formatting.None));
+                string responseText;
+                using (var request = new UnityWebRequest(listUrl, UnityWebRequest.kHttpVerbPOST))
+                {
+                    request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Content-Type", "application/json");
+                    request.SetRequestHeader("Api-Key", apiKey);
+                    request.SetRequestHeader("X-Pinecone-API-Version", "2026-07");
+                    request.timeout = 30;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Pinecone documents/list network request failed: {ex.Message}");
+                    }
+
+                    responseText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        return (all, FormatHttpError(request, request.responseCode, responseText));
+                    }
+                }
+
+                try
+                {
+                    var (pageIds, next) = ParseListIds(responseText);
+                    if (pageIds.Count > 0) allIds.AddRange(pageIds);
+                    nextToken = next;
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Pinecone documents/list response: {ex.Message}");
+                }
+
+                if (string.IsNullOrEmpty(nextToken))
+                {
+                    break;
+                }
+            }
+
+            if (allIds.Count == 0)
+            {
+                return (all, null);
+            }
+
+            const int fetchBatchSize = 100;
+            for (int i = 0; i < allIds.Count; i += fetchBatchSize)
+            {
+                int count = Math.Min(fetchBatchSize, allIds.Count - i);
+                var idsArray = new JArray();
+                for (int j = 0; j < count; j++)
+                {
+                    idsArray.Add(allIds[i + j]);
+                }
+
+                var fetchBody = new JObject { ["ids"] = idsArray };
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(fetchBody.ToString(Formatting.None));
+                string fetchText;
+
+                using (var request = new UnityWebRequest(fetchUrl, UnityWebRequest.kHttpVerbPOST))
+                {
+                    request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Content-Type", "application/json");
+                    request.SetRequestHeader("Api-Key", apiKey);
+                    request.SetRequestHeader("X-Pinecone-API-Version", "2026-07");
+                    request.timeout = 60;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Pinecone documents/fetch network request failed: {ex.Message}");
+                    }
+
+                    fetchText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        return (all, FormatHttpError(request, request.responseCode, fetchText));
+                    }
+                }
+
+                try
+                {
+                    var batchChunks = await Task.Run(() => ParseFetchRecords(fetchText));
+                    all.AddRange(batchChunks);
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Pinecone documents/fetch response: {ex.Message}");
+                }
+            }
+
+            return (all, null);
+        }
+
+        private static (List<string> ids, string nextToken) ParseListIds(string json)
+        {
+            var ids = new List<string>();
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return (ids, null);
+            }
+
+            var root = JObject.Parse(json);
+            var items = (root["vectors"] as JArray) ?? (root["documents"] as JArray);
+            if (items != null)
+            {
+                foreach (var item in items)
+                {
+                    string id = item?["id"]?.ToString() ?? item?["_id"]?.ToString();
+                    if (!string.IsNullOrEmpty(id))
+                    {
+                        ids.Add(id);
+                    }
+                }
+            }
+
+            string next = root["pagination"]?["next"]?.ToString();
+            return (ids, string.IsNullOrWhiteSpace(next) ? null : next);
+        }
+
+        private static List<DocumentChunk> ParseFetchRecords(string json)
+        {
+            var chunks = new List<DocumentChunk>();
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return chunks;
+            }
+
+            var root = JObject.Parse(json);
+            var map = (root["vectors"] as JObject) ?? (root["documents"] as JObject);
+            if (map == null)
+            {
+                return chunks;
+            }
+
+            foreach (var prop in map.Properties())
+            {
+                var obj = prop.Value as JObject;
+                if (obj == null) continue;
+
+                var meta = (obj["metadata"] as JObject) ?? (obj["fields"] as JObject);
+                string id = obj["id"]?.ToString() ?? obj["_id"]?.ToString() ?? prop.Name;
+                string text = meta?["text"]?.ToString() ?? meta?["content"]?.ToString()
+                              ?? obj["text"]?.ToString() ?? obj["content"]?.ToString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                string docId = meta?["document_id"]?.ToString() ?? obj["document_id"]?.ToString() ?? string.Empty;
+                string source = meta?["source_name"]?.ToString() ?? obj["source_name"]?.ToString() ?? string.Empty;
+                int chunkIndex = (int?)meta?["chunk_index"] ?? (int?)obj["chunk_index"] ?? 0;
+
+                float[] vector = null;
+                var vecArr = (obj["values"] as JArray) ?? (obj["embedding"] as JArray) ?? (meta?["embedding"] as JArray);
+                if (vecArr != null && vecArr.Count > 0)
+                {
+                    vector = new float[vecArr.Count];
+                    for (int i = 0; i < vecArr.Count; i++)
+                    {
+                        vector[i] = (float)vecArr[i];
+                    }
+                }
+
+                string metadataJson = meta != null ? meta.ToString(Formatting.None) : "{}";
+                chunks.Add(new DocumentChunk(id, docId, source, chunkIndex, text, vector, metadataJson));
+            }
+
+            return chunks;
         }
 
         /// <summary>

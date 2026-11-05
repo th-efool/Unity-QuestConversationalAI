@@ -10,7 +10,7 @@ namespace OpenAI.RAG
     /// over a pre-computed <see cref="LocalVectorDatabaseSO"/> ScriptableObject.
     /// Operates 100% offline with zero external network dependencies on client devices.
     /// </summary>
-    public class LocalAssetVectorProvider : IVectorStoreProvider
+    public class LocalAssetVectorProvider : IVectorStoreProvider, IBulkExportProvider
     {
         private readonly RagConfig _config;
 
@@ -163,6 +163,50 @@ namespace OpenAI.RAG
             }
 
             return Task.FromResult((true, $"Local database ready with {_config.localDatabase.chunks.Count} chunks."));
+        }
+
+        /// <summary>
+        /// Exports all chunks from the assigned <see cref="LocalVectorDatabaseSO"/> ScriptableObject
+        /// so <see cref="RagLocalCache"/> can build a BM25 lexical + normalised dot-product index.
+        /// Clones each embedding array so in-place normalisation does not mutate the serialized Unity asset.
+        /// </summary>
+        public Task<(List<DocumentChunk> chunks, string error)> ExportAllAsync(string apiKeyOverride = null)
+        {
+            var exported = new List<DocumentChunk>();
+            if (_config == null || _config.localDatabase == null)
+            {
+                return Task.FromResult((exported, "Local database ScriptableObject is not assigned in RagConfig."));
+            }
+
+            var source = _config.localDatabase.chunks;
+            if (source == null || source.Count == 0)
+            {
+                return Task.FromResult((exported, (string)null));
+            }
+
+            for (int i = 0; i < source.Count; i++)
+            {
+                var c = source[i];
+                if (c == null || string.IsNullOrWhiteSpace(c.text)) continue;
+
+                float[] vecCopy = null;
+                if (c.embedding != null && c.embedding.Length > 0)
+                {
+                    vecCopy = (float[])c.embedding.Clone();
+                }
+
+                exported.Add(new DocumentChunk(
+                    c.id,
+                    c.documentId,
+                    c.sourceName,
+                    c.chunkIndex,
+                    c.text,
+                    vecCopy,
+                    c.metadataJson
+                ));
+            }
+
+            return Task.FromResult((exported, (string)null));
         }
     }
 }

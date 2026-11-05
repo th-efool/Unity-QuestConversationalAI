@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -12,7 +13,7 @@ namespace OpenAI.RAG
     /// Vector store provider implementation for PostgreSQL with the pgvector extension,
     /// hosted on Supabase and accessed via PostgREST and Remote Procedure Calls (RPC).
     /// </summary>
-    public class SupabaseVectorProvider : IVectorStoreProvider
+    public class SupabaseVectorProvider : IVectorStoreProvider, IBulkExportProvider
     {
         private readonly RagConfig _config;
 
@@ -420,6 +421,162 @@ namespace OpenAI.RAG
             sb.AppendLine("$$;");
 
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Downloads every row (content, metadata, and pgvector embedding) from the configured Supabase table
+        /// via PostgREST pagination so the knowledge base can be mirrored into <see cref="RagLocalIndex"/>.
+        /// Endpoint: GET {baseRestUrl}/{tableName}?select=id,document_id,source_name,chunk_index,content,metadata,embedding&amp;order=id.asc&amp;limit=500&amp;offset={offset}
+        /// </summary>
+        public async Task<(List<DocumentChunk> chunks, string error)> ExportAllAsync(string apiKeyOverride = null)
+        {
+            var all = new List<DocumentChunk>();
+            string apiKey = ResolveApiKey(apiKeyOverride);
+            if (string.IsNullOrWhiteSpace(apiKey))
+            {
+                return (all, "Supabase API key is missing. Set runtimeApiKey in RagConfig or provide apiKeyOverride.");
+            }
+
+            string baseRestUrl = GetBaseRestUrl();
+            if (string.IsNullOrWhiteSpace(baseRestUrl))
+            {
+                return (all, "Supabase database URI is missing. Set databaseUri in RagConfig.");
+            }
+
+            string tableName = GetTableName();
+            const int pageSize = 500;
+
+            for (int page = 0; page < 100; page++)
+            {
+                int offset = page * pageSize;
+                string endpoint = $"{baseRestUrl}/{tableName}?select=id,document_id,source_name,chunk_index,content,metadata,embedding&order=id.asc&limit={pageSize}&offset={offset}";
+
+                string responseText;
+                using (var request = UnityWebRequest.Get(endpoint))
+                {
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("apikey", apiKey);
+                    request.SetRequestHeader("Authorization", $"Bearer {apiKey}");
+                    request.timeout = 60;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Network error during Supabase export: {ex.Message}");
+                    }
+
+                    responseText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        return (all, FormatHttpError(request, request.responseCode, responseText));
+                    }
+                }
+
+                List<DocumentChunk> pageChunks;
+                try
+                {
+                    pageChunks = await Task.Run(() => ParseExportRows(responseText));
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Supabase export response: {ex.Message}");
+                }
+
+                if (pageChunks == null || pageChunks.Count == 0)
+                {
+                    break;
+                }
+
+                all.AddRange(pageChunks);
+                if (pageChunks.Count < pageSize)
+                {
+                    break;
+                }
+            }
+
+            return (all, null);
+        }
+
+        private static List<DocumentChunk> ParseExportRows(string json)
+        {
+            var list = new List<DocumentChunk>();
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return list;
+            }
+
+            var rows = JToken.Parse(json) as JArray;
+            if (rows == null)
+            {
+                return list;
+            }
+
+            foreach (var item in rows)
+            {
+                if (item == null) continue;
+
+                string content = item["content"]?.ToString() ?? item["text"]?.ToString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(content)) continue;
+
+                string id = item["id"]?.ToString() ?? string.Empty;
+                string docId = item["document_id"]?.ToString() ?? item["documentId"]?.ToString() ?? string.Empty;
+                string sourceName = item["source_name"]?.ToString() ?? item["sourceName"]?.ToString() ?? string.Empty;
+                int chunkIndex = (int?)item["chunk_index"] ?? (int?)item["chunkIndex"] ?? 0;
+                string metadataJson = item["metadata"] != null
+                    ? item["metadata"].ToString(Newtonsoft.Json.Formatting.None)
+                    : string.Empty;
+                float[] embedding = ParseEmbeddingToken(item["embedding"]);
+
+                list.Add(new DocumentChunk(id, docId, sourceName, chunkIndex, content, embedding, metadataJson));
+            }
+
+            return list;
+        }
+
+        private static float[] ParseEmbeddingToken(JToken token)
+        {
+            if (token == null || token.Type == JTokenType.Null)
+            {
+                return null;
+            }
+
+            if (token is JArray arr)
+            {
+                if (arr.Count == 0) return null;
+                var vec = new float[arr.Count];
+                for (int i = 0; i < arr.Count; i++)
+                {
+                    vec[i] = (float)arr[i];
+                }
+                return vec;
+            }
+
+            if (token.Type == JTokenType.String)
+            {
+                string s = token.ToString().Trim();
+                if (s.StartsWith("[", StringComparison.Ordinal) && s.EndsWith("]", StringComparison.Ordinal))
+                {
+                    s = s.Substring(1, s.Length - 2);
+                }
+                if (string.IsNullOrWhiteSpace(s)) return null;
+
+                string[] parts = s.Split(',');
+                var vec = new float[parts.Length];
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    if (!float.TryParse(parts[i].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float val))
+                    {
+                        return null;
+                    }
+                    vec[i] = val;
+                }
+                return vec;
+            }
+
+            return null;
         }
 
         private string ResolveApiKey(string overrideKey)
