@@ -144,6 +144,35 @@ namespace OpenAI.RAG
         [Tooltip("Minimum cosine similarity threshold (0.0 to 1.0). Matches below this score are discarded.")]
         public float similarityThreshold = 0.35f;
 
+        [Header("Instant Retrieval (Local Cache)")]
+        [Tooltip("Download the whole knowledge base at startup and search it in memory. Keyword hits need no network; semantic hits need only the query embedding.")]
+        public bool enableLocalCache = true;
+
+        [Tooltip("Keep a binary copy of the knowledge base in Application.persistentDataPath so the next launch is instant even offline.")]
+        public bool persistLocalCacheToDisk = true;
+
+        [Range(0.2f, 1f)]
+        [Tooltip("A keyword (BM25) match is trusted without an embedding call when at least this fraction of the question's terms appear in the top chunk.")]
+        public float lexicalConfidence = 0.6f;
+
+        [Range(1, 10)]
+        [Tooltip("Maximum chunks returned to the realtime model by the search tool. Fewer chunks means faster speech.")]
+        public int toolMaxResults = 2;
+
+        [Range(100, 2000)]
+        [Tooltip("Maximum characters of each chunk returned to the realtime model by the search tool.")]
+        public int toolMaxCharsPerChunk = 600;
+
+        [Tooltip("Typical questions embedded once at startup. This primes the HTTPS connection and makes these queries instant.")]
+        public string[] warmupQueries = new string[]
+        {
+            "mechanical seal torque specification",
+            "impeller clearance inspection",
+            "bearing lubrication oil",
+            "shaft coupling alignment",
+            "pump troubleshooting leakage"
+        };
+
         [Header("Realtime Tool Definition")]
         [Tooltip("Function name registered in AgentToolRegistry for autonomous tool calling.")]
         public string toolName = "search_knowledge_base";

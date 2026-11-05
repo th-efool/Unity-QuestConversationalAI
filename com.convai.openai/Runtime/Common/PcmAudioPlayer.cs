@@ -9,9 +9,15 @@ using UnityEngine.Assertions;
 public class PcmAudioPlayer : MonoBehaviour
 {
     [SerializeField] private AudioSource audioSource;
-    [SerializeField] private int sampleRate = 16000;
+    [SerializeField] private int sampleRate = 24000;
     
     private readonly Queue<AudioClip> _clipQueue = new();
+
+    /// <summary>
+    /// True while an audio clip is actively playing OR queued clips are waiting to play.
+    /// Prevents false negatives during the 1-frame gap between queued audio chunks.
+    /// </summary>
+    public bool IsPlaying => (audioSource != null && audioSource.isPlaying) || _clipQueue.Count > 0;
     
     #region Unity Lifecycle
 
@@ -22,8 +28,14 @@ public class PcmAudioPlayer : MonoBehaviour
 
     private void Update()
     {
-        if (audioSource.isPlaying || _clipQueue.Count == 0)
+        if (audioSource == null || audioSource.isPlaying || _clipQueue.Count == 0)
             return;
+
+        if (audioSource.clip != null)
+        {
+            Destroy(audioSource.clip);
+            audioSource.clip = null;
+        }
 
         audioSource.clip = _clipQueue.Dequeue();
         audioSource.Play();
@@ -64,8 +76,21 @@ public class PcmAudioPlayer : MonoBehaviour
     /// </summary>
     public void StopImmediately()
     {
-        _clipQueue.Clear();
-        audioSource.Stop();
+        while (_clipQueue.Count > 0)
+        {
+            var queued = _clipQueue.Dequeue();
+            if (queued != null) Destroy(queued);
+        }
+
+        if (audioSource != null)
+        {
+            audioSource.Stop();
+            if (audioSource.clip != null)
+            {
+                Destroy(audioSource.clip);
+                audioSource.clip = null;
+            }
+        }
     }
 
     #endregion

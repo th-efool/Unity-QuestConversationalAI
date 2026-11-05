@@ -29,6 +29,7 @@ namespace OpenAI
 
         [Header("Startup")]
         [SerializeField] private bool startOnAwake = true;
+        [SerializeField] private bool reconnectAutomatically = true;
 
         [Header("Dependencies")]
         [SerializeField] private OpenAIConfig       config;
@@ -50,6 +51,8 @@ namespace OpenAI
         public UnityEvent<string> onUserTranscript;
         public UnityEvent<bool>   onUserSpeaking;
         public UnityEvent<bool>   onAgentSpeaking;
+        public UnityEvent<string> onConnectionState;
+        public UnityEvent<string> onKnowledgeStatus;
 
         #endregion
 
@@ -65,53 +68,45 @@ namespace OpenAI
 
         private readonly ToolCallState _toolCalls = new ();
         private int _thinkingDepth;
+        private bool _starting;
+        private bool _shuttingDown;
+        private double _reconnectAt = double.PositiveInfinity;
+        private int _reconnectAttempts;
+        private readonly HashSet<string> _executingToolCalls = new ();
+        private readonly HashSet<string> _unhandledEventTypes = new ();
+        private double _turnT0 = -1.0;
+        private string _turnKind = "turn";
+        private bool _turnFirstAudioLogged;
+        private int _toolsInFlight;
+        private bool _toolContinuationPending;
+        private int _turnGeneration;
+        private bool _terminalRelayError;
+        private string _workerPhone;
+        private bool _isDirectOpenAIFallback;
+        private int _relayFailures = 0;
+        private ArtureRelaySettings _activeSettings;
+        public string WorkerName { get; private set; } = "Unassigned";
+        public string KnowledgeStatus { get; private set; } = "idle";
+        public string KnowledgeSourcesSummary { get; private set; } = string.Empty;
+        public bool IsDirectOpenAIFallback => IsDirectMode;
+        private bool IsDirectMode => _isDirectOpenAIFallback || (_activeSettings != null && _activeSettings.isDirectOpenAI);
+        public string ActiveRelayUrl => _activeSettings?.url;
+        public string CloudRelayUrl => _activeSettings?.cloudUrl ?? "wss://arture-voice-relay.onrender.com/realtime";
+public bool IsSessionReady => _sessionReady;
+        public static event Action<bool> OnMicrophoneMuteChanged;
+        public OpenAIConfig Config => config;
+        public bool IsAgentSpeaking => _agentCurrentlySpeaking;
+        public bool IsResponseActive => _responseActive;
+        public bool IsMicrophoneMuted { get; private set; }
 
         #endregion
 
         #region Unity lifecycle
 
-        private void Start()
+        private void Awake()
         {
-            if (startOnAwake) StartAgent();
-        }
-
-        private void Update()
-        {
-            _ws?.DispatchMessageQueue();
-        }
-
-        private async void OnDisable()         => await Shutdown();
-        private async void OnApplicationQuit() => await Shutdown();
-
-        #endregion
-
-        #region Public API
-        
-        /// <summary>
-        /// Used to get image url added into conversation for image analysis
-        /// Check: https://openai.com/index/introducing-gpt-realtime/
-        /// </summary>
-        public static event Func<string> OnRequestImage; 
-        
-        /// <summary>
-        /// Call this from any GameObject to start talking to the agent
-        /// Normally this is called on start if `startOnAwake` is set to true
-        /// </summary>
-        public async void StartAgent()
-        {
+            PrewarmCloudRelay();
             EnsureRagBridge();
-            try
-            {
-                InitializeWebSocket();
-                RegisterSocketCallbacks();
-                micStreamer.OnAudioChunk += SendMicChunk;
-                await _ws.Connect();
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[OpenAI] Startup failed: {ex}");
-                enabled = false;
-            }
         }
 
         private void EnsureRagBridge()
@@ -136,13 +131,184 @@ namespace OpenAI
             }
         }
 
-        public static event Action<bool> OnMicrophoneMuteChanged;
+        private void PrewarmCloudRelay()
+        {
+            try
+            {
+                var settings = ArtureRelaySettings.Load(config);
+                if (settings != null && settings.isDirectOpenAI) return;
+                var targetUrl = !string.IsNullOrWhiteSpace(settings?.cloudUrl)
+                    ? settings.cloudUrl
+                    : "https://arture-voice-relay.onrender.com/health";
 
-        public bool IsSessionReady => _sessionReady;
-        public OpenAIConfig Config => config;
-        public bool IsAgentSpeaking => _agentCurrentlySpeaking;
-        public bool IsResponseActive => _responseActive;
-        public bool IsMicrophoneMuted { get; private set; }
+                if (targetUrl.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
+                    targetUrl = "https://" + targetUrl.Substring("wss://".Length);
+                else if (targetUrl.StartsWith("ws://", StringComparison.OrdinalIgnoreCase))
+                    targetUrl = "http://" + targetUrl.Substring("ws://".Length);
+
+                if (Uri.TryCreate(targetUrl, UriKind.Absolute, out var uri))
+                {
+                    var healthUrl = $"{uri.Scheme}://{uri.Authority}/health";
+                    StartCoroutine(PrewarmRelayCoroutine(healthUrl));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Arture] Cloud relay pre-warm check skipped: {ex.Message}");
+            }
+        }
+
+        private System.Collections.IEnumerator PrewarmRelayCoroutine(string healthUrl)
+        {
+            using (var req = UnityEngine.Networking.UnityWebRequest.Get(healthUrl))
+            {
+                req.timeout = 25;
+                yield return req.SendWebRequest();
+                if (req.result == UnityEngine.Networking.UnityWebRequest.Result.Success)
+                    Debug.Log($"[Arture] Cloud relay pre-warmed successfully ({healthUrl}).");
+                else
+                    Debug.Log($"[Arture] Cloud relay pre-warm ping dispatched ({req.error}).");
+            }
+        }
+
+        private void Start()
+        {
+            if (startOnAwake) StartAgent();
+        }
+
+        private void Update()
+        {
+            _ws?.DispatchMessageQueue();
+            TryContinueAfterTools();
+            if (!_shuttingDown && !_starting && _ws == null && Time.realtimeSinceStartupAsDouble >= _reconnectAt)
+                StartAgent();
+        }
+
+        private async void OnDisable()         => await Shutdown();
+        private async void OnApplicationQuit() => await Shutdown();
+
+        #endregion
+
+        #region Public API
+        
+        /// <summary>
+        /// Used to get image url added into conversation for image analysis
+        /// Check: https://openai.com/index/introducing-gpt-realtime/
+        /// </summary>
+        public static event Func<string> OnRequestImage; 
+        
+        
+        /// <summary>
+        /// Call this from any GameObject to start talking to the agent
+        /// Normally this is called on start if `startOnAwake` is set to true
+        /// </summary>
+        public async void StartAgent()
+        {
+            if (_starting || _ws != null) return;
+            EnsureRagBridge();
+            _starting = true;
+            _shuttingDown = false;
+            _terminalRelayError = false;
+            _reconnectAt = double.PositiveInfinity;
+            try
+            {
+                InitializeWebSocket();
+                RegisterSocketCallbacks();
+                if (micStreamer != null) { micStreamer.OnAudioChunk -= SendMicChunk; micStreamer.OnAudioChunk += SendMicChunk; }
+                onConnectionState?.Invoke("connecting");
+                await _ws.Connect();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Arture] Connection attempt failed ({ex.GetType().Name}): {ex.Message}");
+                _ws = null;
+                RecordRelayFailureAndCheckFallback($"connect exception: {ex.Message}");
+                ScheduleReconnect();
+            }
+            finally { _starting = false; }
+        }
+
+        private void RecordRelayFailureAndCheckFallback(string reason)
+        {
+            if (_sessionReady || _isDirectOpenAIFallback) return;
+
+            _relayFailures++;
+            Debug.LogWarning($"[Arture] Relay connection attempt failed ({reason}). Attempt {_relayFailures} of 5.");
+
+            if (_relayFailures >= 5 && !string.IsNullOrWhiteSpace(_activeSettings?.openAIApiKey))
+            {
+                Debug.LogWarning("[Arture] Live backend relay unreachable after 5 attempts. Falling back directly to OpenAI Realtime API...");
+                _isDirectOpenAIFallback = true;
+                _starting = false;
+                _ws = null;
+                StartAgent();
+            }
+        }
+
+        public void StopAgent() => _ = Shutdown();
+        public void RequestResponse() => SendResponseCreate();
+        public async void ForceReconnectRelay(string overrideUrl = null)
+        {
+            _isDirectOpenAIFallback = false;
+            if (_activeSettings != null && !string.IsNullOrWhiteSpace(overrideUrl))
+            {
+                _activeSettings.url = overrideUrl;
+                _activeSettings.deviceUrl = overrideUrl;
+            }
+            await Shutdown();
+            _starting = false;
+            StartAgent();
+        }
+
+        public void IdentifyWorker(string phone)
+        {
+            _workerPhone = phone ?? "";
+            if (_ws != null && _ws.State == WebSocketState.Open && !IsDirectMode && !string.IsNullOrWhiteSpace(_workerPhone))
+                _ = _ws.SendText(new JObject { ["type"] = "arture.identify", ["phone"] = _workerPhone }.ToString(Formatting.None));
+        }
+
+        private void ScheduleReconnect()
+        {
+            _sessionReady = false;
+            _responseActive = false;
+            _responseCreateSent = false;
+            _toolContinuationPending = false;
+            onConnectionState?.Invoke(_terminalRelayError ? "error" : "disconnected");
+            if (_shuttingDown || _terminalRelayError || !reconnectAutomatically || !isActiveAndEnabled) return;
+            _reconnectAt = Time.realtimeSinceStartupAsDouble + Math.Min(15, Math.Pow(2, Math.Min(_reconnectAttempts++, 4)));
+        }
+
+        /// <summary>
+        /// Force stop agent
+        /// Used it to cancel any interaction and close the socket immediately
+        /// </summary>
+        public void InterruptNow()
+        {
+            TryCancelAssistantResponse();
+        }
+
+        public void SendContextMessage(string contextText)
+        {
+            if (_ws == null || _ws.State != WebSocketState.Open || string.IsNullOrWhiteSpace(contextText)) return;
+            var item = new JObject
+            {
+                ["type"] = "conversation.item.create",
+                ["item"] = new JObject
+                {
+                    ["type"] = "message",
+                    ["role"] = "user",
+                    ["content"] = new JArray
+                    {
+                        new JObject
+                        {
+                            ["type"] = "input_text",
+                            ["text"] = $"[System Knowledge Context]:\n{contextText}"
+                        }
+                    }
+                }
+            };
+            _ = _ws.SendText(item.ToString(Formatting.None));
+        }
 
         public void SetMicrophoneMuted(bool muted)
         {
@@ -151,38 +317,31 @@ namespace OpenAI
             {
                 micStreamer.IsMuted = muted;
             }
-
             try
             {
                 OnMicrophoneMuteChanged?.Invoke(muted);
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[OpenAI] OnMicrophoneMuteChanged error: {ex.Message}");
+                Debug.LogWarning($"[Arture] OnMicrophoneMuteChanged error: {ex.Message}");
             }
-
             if (muted && _ws != null && _ws.State == WebSocketState.Open)
             {
                 _ = _ws.SendText("{\"type\":\"input_audio_buffer.clear\"}");
             }
         }
 
-        public void RequestResponse() => SendResponseCreate(commitAudio: false);
-
-        /// <summary>
-        /// Sends a text message as a user conversation item to the Realtime API and requests a response.
-        /// The model responds with voice audio, transcript deltas, and tool calls identically to spoken input.
-        /// If the agent is currently speaking, barge-in is triggered automatically.
-        /// </summary>
         public async void SendUserTextMessage(string userText, bool includeImageIfAvailable = true)
         {
             if (string.IsNullOrWhiteSpace(userText)) return;
 
             if (_ws == null || _ws.State != WebSocketState.Open || !_sessionReady)
             {
-                Debug.LogWarning("[OpenAI] Cannot send text message: WebSocket is not open or session is not ready.");
+                Debug.LogWarning("[Arture] Cannot send text message: WebSocket is not open or session is not ready.");
                 return;
             }
+
+            MarkTurnStart("text");
 
             // 1. Barge-in: if agent is currently speaking or has an active turn, cancel it immediately
             if (_agentCurrentlySpeaking || _responseActive || _responseCreateSent)
@@ -192,8 +351,11 @@ namespace OpenAI
                 _responseCreateSent = false;
             }
 
-            // 2. Clear any uncommitted mic audio
-            await _ws.SendText("{\"type\":\"input_audio_buffer.clear\"}");
+            // 2. Clear any uncommitted mic audio only when mic is active
+            if (!IsMicrophoneMuted)
+            {
+                await _ws.SendText("{\"type\":\"input_audio_buffer.clear\"}");
+            }
 
             // 3. Notify local listeners (UI logs, subtitles, RAG proactive context injection)
             string trimmedText = userText.Trim();
@@ -203,7 +365,7 @@ namespace OpenAI
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[OpenAI] Exception in onUserTranscript listener: {ex.Message}");
+                Debug.LogWarning($"[Arture] Exception in onUserTranscript listener: {ex.Message}");
             }
 
             // 4. Attach image if available
@@ -234,43 +396,7 @@ namespace OpenAI
 
             // 6. Request model response (pure text turn, do not commit empty audio buffer)
             _lastCreateSentTime = 0;
-            SendResponseCreate(commitAudio: false);
-        }
-
-        /// <summary>
-        /// Force stop agent
-        /// Used it to cancel any interaction and close the socket immediately
-        /// </summary>
-        #region Realtime commands
-
-        public void SendContextMessage(string contextText)
-        {
-            if (_ws == null || _ws.State != WebSocketState.Open || string.IsNullOrWhiteSpace(contextText)) return;
-            var item = new JObject
-            {
-                ["type"] = "conversation.item.create",
-                ["item"] = new JObject
-                {
-                    ["type"] = "message",
-                    ["role"] = "user",
-                    ["content"] = new JArray
-                    {
-                        new JObject
-                        {
-                            ["type"] = "input_text",
-                            ["text"] = $"[System Knowledge Context]:\n{contextText}"
-                        }
-                    }
-                }
-            };
-            _ = _ws.SendText(item.ToString(Formatting.None));
-        }
-
-        #endregion
-
-        public void InterruptNow()
-        {
-            TryCancelAssistantResponse();
+            SendResponseCreate();
         }
 
         #endregion
@@ -279,17 +405,21 @@ namespace OpenAI
 
         private async Task Shutdown()
         {
+            if (_shuttingDown) return;
+            _shuttingDown = true;
+            _reconnectAt = double.PositiveInfinity;
+            _sessionReady = false;
             try
             {
-                micStreamer.OnAudioChunk -= SendMicChunk;
-                micStreamer.StopStreaming();
-                audioPlayer.StopImmediately();
+                if (micStreamer != null) { micStreamer.OnAudioChunk -= SendMicChunk; micStreamer.StopStreaming(); }
+                if (audioPlayer != null) audioPlayer.StopImmediately();
                 StopThinkingSfx(true);
 
                 if (_ws != null)
                 {
-                    if (_ws.State == WebSocketState.Open)
-                        await _ws.Close();
+                    if (_ws.State == WebSocketState.Open && !IsDirectMode)
+                        await _ws.SendText("{\"type\":\"arture.session.end\"}");
+                    await _ws.Close();
                     _ws = null;
                 }
             }
@@ -317,6 +447,20 @@ namespace OpenAI
 
             switch (baseEvt?.Type)
             {
+                case "arture.knowledge":
+                    var knowledge = JObject.Parse(text);
+                    KnowledgeStatus = knowledge.Value<string>("status") ?? "unavailable";
+                    var sourceLabels = new System.Collections.Generic.List<string>();
+                    if (knowledge["sources"] is JArray sources)
+                        foreach (var source in sources)
+                            sourceLabels.Add($"{(source.Value<string>("originalName") ?? "Manual").Replace("<", "‹").Replace(">", "›")} · Page {source.Value<int>("page")}");
+                    KnowledgeSourcesSummary = string.Join("\n", sourceLabels);
+                    onKnowledgeStatus?.Invoke(KnowledgeStatus);
+                    break;
+                case "arture.worker":
+                    var worker = JObject.Parse(text);
+                    WorkerName = worker.Value<bool>("matched") ? worker.Value<string>("name") ?? "Unassigned" : "Unassigned";
+                    break;
                 case "session.created":
                     HandleSessionCreated();
                     break;
@@ -346,7 +490,6 @@ namespace OpenAI
                     break;
 
                 case "conversation.item.created":
-                case "conversation.item.added":
                     HandleConversationItemCreated();
                     break;
 
@@ -398,6 +541,16 @@ namespace OpenAI
                     break;
 
                 case "rate_limits.updated":
+                case "conversation.item.done":
+                case "conversation.item.truncated":
+                case "conversation.item.input_audio_transcription.segment":
+                case "input_audio_buffer.cleared":
+                case "response.output_text.delta":
+                case "response.output_text.done":
+                    HandleNoop();
+                    break;
+
+                case "conversation.item.added":
                     HandleNoop();
                     break;
 
@@ -406,7 +559,8 @@ namespace OpenAI
                     break;
 
                 default:
-                    Debug.Log($"[OpenAI] Unhandled event type: {baseEvt?.Type}");
+                    if (_unhandledEventTypes.Add(baseEvt?.Type ?? "(null)"))
+                        Debug.Log($"[OpenAI] Unhandled event type (logged once): {baseEvt?.Type}");
                     break;
             }
         }
@@ -430,35 +584,18 @@ namespace OpenAI
 
         private void SendSessionUpdate()
         {
-            JObject session;
+            if (IsDirectMode)
+            {
+                var enrichedPrompt = systemPrompt ?? string.Empty;
+                if (!enrichedPrompt.Contains("Centrifugal Water Pump"))
+                {
+                    enrichedPrompt += "\nYou are the Arture AR assistant for the Centrifugal Water Pump (asset ATR-DEMO-PUMP-001). Guide the technician through maintenance, troubleshooting, and inspection. Use Machine_GetComponents to inspect machine parts, Machine_ShowAnswer to highlight a component and display spatial instructions, Machine_ShowMessage for spatial warnings/alerts, and Machine_Rotate, Machine_SetScale, or Machine_Translate to position the 3D model.";
+                }
 
-            if (IsBetaModel)
-            {
-                // Legacy OpenAI Realtime Beta / Preview schema (e.g. gpt-4o-realtime-preview)
-                session = new JObject
+                var directSession = new JObject
                 {
-                    ["instructions"] = systemPrompt ?? string.Empty,
-                    ["modalities"]   = new JArray("text", "audio"),
-                    ["voice"]        = ResolveVoiceString(),
-                    ["input_audio_transcription"] = new JObject { ["model"] = "gpt-4o-mini-transcribe" },
-                    ["turn_detection"] = new JObject
-                    {
-                        ["type"] = "server_vad",
-                        ["create_response"] = false
-                    },
-                    ["tools"] = AgentToolRegistry.GetToolsSpec()
-                };
-            }
-            else
-            {
-                // OpenAI Realtime GA schema (e.g. gpt-realtime, gpt-realtime-mini)
-                // 1. session.type must be explicitly declared as "realtime".
-                // 2. Modalities array is omitted (session.type: "realtime" defaults to text + audio).
-                // 3. Audio input and output configurations are structured under "audio" (PCM 24kHz).
-                session = new JObject
-                {
-                    ["type"]         = "realtime",
-                    ["instructions"] = systemPrompt ?? string.Empty,
+                    ["type"] = "realtime",
+                    ["instructions"] = enrichedPrompt,
                     ["audio"] = new JObject
                     {
                         ["input"] = new JObject
@@ -483,13 +620,39 @@ namespace OpenAI
                     },
                     ["tools"] = AgentToolRegistry.GetToolsSpec()
                 };
+
+                var directUpd = new JObject { ["type"] = "session.update", ["session"] = directSession };
+                _ = _ws.SendText(directUpd.ToString(Formatting.None));
+                return;
             }
+
+            // server VAD on, but we create responses ourselves at speech stop
+            var session = new JObject
+            {
+                ["type"] = "realtime",
+                ["instructions"] = systemPrompt ?? string.Empty,
+                ["audio"] = new JObject
+                {
+                    ["input"] = new JObject
+                    {
+                        ["format"] = new JObject { ["type"] = "audio/pcm", ["rate"] = 24000 },
+                        ["transcription"] = new JObject { ["model"] = "gpt-live-transcribe", ["language"] = "en" },
+                        ["turn_detection"] = new JObject { ["type"] = "server_vad", ["create_response"] = false, ["interrupt_response"] = true }
+                    },
+                    ["output"] = new JObject
+                    {
+                        ["format"] = new JObject { ["type"] = "audio/pcm", ["rate"] = 24000 },
+                        ["voice"] = ResolveVoiceString()
+                    }
+                },
+                ["tools"] = AgentToolRegistry.GetToolsSpec()
+            };
 
             var upd = new JObject { ["type"] = "session.update", ["session"] = session };
             _ = _ws.SendText(upd.ToString(Formatting.None));
         }
 
-        private void SendResponseCreate(bool commitAudio = false)
+        private void SendResponseCreate()
         {
             if (_ws == null || _ws.State != WebSocketState.Open) return;
             if (_responseActive || _responseCreateSent) return;
@@ -500,18 +663,14 @@ namespace OpenAI
             _lastCreateSentTime = now;
             _responseCreateSent = true;
 
-            if (commitAudio)
-            {
-                var commit = new JObject { ["type"] = "input_audio_buffer.commit" };
-                _ = _ws.SendText(commit.ToString(Formatting.None));
-            }
-
             var create = new JObject { ["type"] = "response.create" };
             _ = _ws.SendText(create.ToString(Formatting.None));
         }
 
         private void TryCancelAssistantResponse()
         {
+            _turnGeneration++;
+            _toolContinuationPending = false;
             if (_ws == null || _ws.State != WebSocketState.Open) return;
 
             var cancel = new JObject { ["type"] = "response.cancel" };
@@ -556,6 +715,10 @@ namespace OpenAI
 
         private async Task ExecuteToolCallIfReady(string callId)
         {
+            if (!_executingToolCalls.Add(callId)) return;
+            var sourceSocket = _ws;
+            var generation = _turnGeneration;
+            _toolsInFlight++;
             try
             {
                 if (!_toolCalls.TryGetName(callId, out var toolName))
@@ -570,7 +733,7 @@ namespace OpenAI
                 if (!AgentToolRegistry.TryGetHandler(toolName, out var handler))
                 {
                     Debug.LogWarning($"[OpenAI] Tool not registered: {toolName}");
-                    await SendToolOutputAndContinue(callId, "");
+                    await SendToolOutputAndContinue(callId, "", sourceSocket, generation);
                     return;
                 }
 
@@ -582,6 +745,21 @@ namespace OpenAI
                     args = new JObject();
                 }
 
+                if (toolName == "Machine_ShowAnswer")
+                {
+                    var currentAnswer = args.Value<string>("answer") ?? string.Empty;
+                    if (KnowledgeStatus == "retrieved" && !string.IsNullOrWhiteSpace(KnowledgeSourcesSummary))
+                    {
+                        args["answer"] = currentAnswer + "\n\nRetrieved references:\n" + KnowledgeSourcesSummary;
+                    }
+                    else if (string.IsNullOrWhiteSpace(currentAnswer) && (KnowledgeStatus == "no_sources" || KnowledgeStatus == "unavailable"))
+                    {
+                        args["answer"] = KnowledgeStatus == "no_sources"
+                            ? "The uploaded manuals do not provide supporting passages for this question. Add a relevant manual or clarify the question."
+                            : "The manual search is unavailable. Please try again before relying on an operating procedure.";
+                    }
+                }
+
                 object resultAny = await handler(args);
 
                 string outputStr;
@@ -590,23 +768,25 @@ namespace OpenAI
                 else if (resultAny is JToken jt) outputStr = jt.ToString(Formatting.None);
                 else outputStr = JsonConvert.SerializeObject(resultAny, Formatting.None);
 
-                await SendToolOutputAndContinue(callId, outputStr);
+                await SendToolOutputAndContinue(callId, outputStr, sourceSocket, generation);
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[OpenAI] Tool execution failed: {ex}");
-                await SendToolOutputAndContinue(callId, JsonConvert.SerializeObject(new { ok = false, error = ex.Message }));
+                await SendToolOutputAndContinue(callId, JsonConvert.SerializeObject(new { ok = false, error = ex.Message }), sourceSocket, generation);
             }
             finally
             {
                 _toolCalls.Clear(callId);
                 StopThinkingSfx();
+                _toolsInFlight--;
+                TryContinueAfterTools();
             }
         }
 
-        private async Task SendToolOutputAndContinue(string callId, string outputStr)
+        private async Task SendToolOutputAndContinue(string callId, string outputStr, WebSocket sourceSocket, int generation)
         {
-            if (_ws == null || _ws.State != WebSocketState.Open) return;
+            if (!_sessionReady || _ws != sourceSocket || generation != _turnGeneration || _ws == null || _ws.State != WebSocketState.Open) return;
 
             var toolResultItem = new JObject
             {
@@ -619,9 +799,15 @@ namespace OpenAI
                 }
             };
             await _ws.SendText(toolResultItem.ToString(Formatting.None));
+            if (_ws == sourceSocket && generation == _turnGeneration) _toolContinuationPending = true;
+        }
 
-            var create = new JObject { ["type"] = "response.create" };
-            await _ws.SendText(create.ToString(Formatting.None));
+        private void TryContinueAfterTools()
+        {
+            if (!_toolContinuationPending || !_sessionReady || _toolsInFlight > 0 || _responseActive || _responseCreateSent) return;
+            if (Time.realtimeSinceStartupAsDouble - _lastCreateSentTime < MinCreateIntervalSec) return;
+            _toolContinuationPending = false;
+            SendResponseCreate();
         }
 
         private async Task MaybeSendImageItemAsync()
@@ -700,21 +886,42 @@ namespace OpenAI
 
         #region Socket helpers
 
-        private bool IsBetaModel => !string.IsNullOrEmpty(model) && model.IndexOf("preview", StringComparison.OrdinalIgnoreCase) >= 0;
-
         private void InitializeWebSocket()
         {
-            var url = $"{config.realtimeConvWebsocketUrl}?model={Uri.EscapeDataString(model)}";
-            var headers = new Dictionary<string, string>
-            {
-                { "Authorization", $"Bearer {config.apiKey}" }
-            };
+            _activeSettings = ArtureRelaySettings.Load(config);
+            if (!string.IsNullOrWhiteSpace(_activeSettings.workerPhone)) _workerPhone = _activeSettings.workerPhone;
 
-            // Beta preview models (e.g. gpt-4o-realtime-preview) require the OpenAI-Beta header.
-            // GA production models (e.g. gpt-realtime, gpt-realtime-mini) should not include it.
-            if (IsBetaModel)
+            string url;
+            Dictionary<string, string> headers;
+
+            if (_isDirectOpenAIFallback || _activeSettings.isDirectOpenAI)
             {
-                headers["OpenAI-Beta"] = "realtime=v1";
+                var directUrl = !string.IsNullOrWhiteSpace(_activeSettings.directOpenAIUrl)
+                    ? _activeSettings.directOpenAIUrl
+                    : "wss://api.openai.com/v1/realtime";
+                var separator = directUrl.Contains("?") ? "&" : "?";
+                url = $"{directUrl}{separator}model={Uri.EscapeDataString(model)}";
+
+                var key = !string.IsNullOrWhiteSpace(_activeSettings.openAIApiKey)
+                    ? _activeSettings.openAIApiKey
+                    : _activeSettings.accessToken;
+
+                headers = new Dictionary<string, string>
+                {
+                    { "Authorization", $"Bearer {key}" }
+                };
+                Debug.Log($"[Arture] Connecting directly to OpenAI Realtime: {directUrl} (Model: {model})");
+                onKnowledgeStatus?.Invoke("direct_openai");
+            }
+            else
+            {
+                var separator = _activeSettings.url.Contains("?") ? "&" : "?";
+                url = $"{_activeSettings.url}{separator}assetCode={Uri.EscapeDataString(_activeSettings.assetCode)}";
+                headers = new Dictionary<string, string>
+                {
+                    { "Authorization", $"Bearer {_activeSettings.accessToken}" }
+                };
+                Debug.Log($"[Arture] Connecting to Arture Voice Relay: {_activeSettings.url} (Asset: {_activeSettings.assetCode})");
             }
 
             _ws = new WebSocket(url, headers);
@@ -722,9 +929,44 @@ namespace OpenAI
 
         private void RegisterSocketCallbacks()
         {
-            _ws.OnOpen    += () => Debug.Log("[OpenAI] WS connected.");
-            _ws.OnClose   += code => Debug.Log($"[OpenAI] WS closed ({code})");
-            _ws.OnError   += err  => Debug.LogError($"[OpenAI] WS error: {err}");
+            var socket = _ws;
+            socket.OnOpen += () =>
+            {
+                _relayFailures = 0;
+                WorkerName = "Unassigned";
+                KnowledgeStatus = IsDirectMode ? "direct_openai" : "idle";
+                KnowledgeSourcesSummary = string.Empty;
+                if (!IsDirectMode)
+                {
+                    IdentifyWorker(_workerPhone);
+                    Debug.Log("[Arture] Relay socket open; waiting for voice session setup.");
+                }
+                else
+                {
+                    Debug.Log("[Arture] Direct OpenAI socket open; waiting for voice session setup.");
+                }
+            };
+            socket.OnClose += code =>
+            {
+                if (_ws != socket) return;
+                _ws = null;
+                if (audioPlayer != null) audioPlayer.StopImmediately();
+                StopThinkingSfx(true);
+                _agentCurrentlySpeaking = false;
+                onAgentSpeaking?.Invoke(false);
+
+                if (!_sessionReady && !IsDirectMode)
+                {
+                    RecordRelayFailureAndCheckFallback($"closed with code {code}");
+                }
+
+                ScheduleReconnect();
+                Debug.Log($"[Arture] Socket disconnected ({code}).");
+            };
+            socket.OnError += err =>
+            {
+                Debug.LogError($"[Arture] Transport error: {err}");
+            };
             _ws.OnMessage += OnSocketMessage;
         }
 
@@ -734,12 +976,20 @@ namespace OpenAI
 
         private void HandleSessionCreated()
         {
-            _sessionReady = true;
             SendSessionUpdate();
-            micStreamer.StartStreaming();
         }
 
-        private void HandleSessionUpdated() { }
+        private void HandleSessionUpdated()
+        {
+            if (_sessionReady) return;
+            _sessionReady = true;
+            _turnGeneration++;
+            _reconnectAttempts = 0;
+            _executingToolCalls.Clear();
+            _toolCalls.ClearAll();
+            onConnectionState?.Invoke("connected");
+            if (micStreamer != null && micStreamer.enabled) micStreamer.StartStreaming();
+        }
 
         private void HandleSpeechStarted() => onUserSpeaking?.Invoke(true);
 
@@ -747,17 +997,12 @@ namespace OpenAI
         {
             onUserSpeaking?.Invoke(false);
 
-            if (_ws != null && _ws.State == WebSocketState.Open)
-            {
-                var commit = new JObject { ["type"] = "input_audio_buffer.commit" };
-                await _ws.SendText(commit.ToString(Formatting.None));
-            }
-
+            // Server VAD already commits this turn. PTT commits once in the microphone starter.
             await MaybeSendImageItemAsync();
-            SendResponseCreate(commitAudio: false);
+            SendResponseCreate();
         }
 
-        private static void HandleInputCommitted() { }
+        private void HandleInputCommitted() { MarkTurnStart("voice"); }
 
         private void HandleInputTranscriptDelta(string json)
         {
@@ -774,7 +1019,7 @@ namespace OpenAI
             try
             {
                 var user = JsonConvert.DeserializeObject<InputAudioTranscriptDone>(json);
-                onUserTranscript?.Invoke(user?.Text ?? "");
+                onUserTranscript?.Invoke(user?.Transcript ?? user?.Text ?? "");
             } catch {}
         }
 
@@ -782,6 +1027,7 @@ namespace OpenAI
 
         private void HandleResponseAudioDelta(string json)
         {
+            LogFirstAudioLatency();
             if (!_agentCurrentlySpeaking)
             {
                 _agentCurrentlySpeaking = true;
@@ -871,7 +1117,12 @@ namespace OpenAI
                 if (item?["type"]?.ToString() == "function_call")
                 {
                     var callId = item["call_id"]?.ToString();
-                    if (!string.IsNullOrEmpty(callId)) _ = ExecuteToolCallIfReady(callId);
+                    if (!string.IsNullOrEmpty(callId))
+                    {
+                        _toolCalls.SetToolName(callId, item["name"]?.ToString());
+                        if (item["arguments"] != null) _toolCalls.SetArgsJson(callId, item["arguments"].ToString());
+                        _ = ExecuteToolCallIfReady(callId);
+                    }
                 }
             }
             catch (Exception ex)
@@ -885,6 +1136,12 @@ namespace OpenAI
             var err = JsonConvert.DeserializeObject<ErrorEvent>(json);
             var code = err?.Error?.Code    ?? "(no code)";
             var msg  = err?.Error?.Message ?? "(no message)";
+            if (code.Contains("invalid_api_key") || code.Contains("insufficient_quota") || code.Contains("model_not_found") || code == "openai_http_401" || code == "openai_http_403")
+            {
+                _terminalRelayError = true;
+                _reconnectAt = double.PositiveInfinity;
+                onConnectionState?.Invoke("error");
+            }
             
             // Avoid the warnings while agent is speaking.
             if (code == "input_audio_buffer_commit_empty")
@@ -899,6 +1156,38 @@ namespace OpenAI
                 _responseCreateSent = false;
             }
             StopThinkingSfx();
+        }
+
+        private void MarkTurnStart(string kind)
+        {
+            _turnT0 = Time.realtimeSinceStartupAsDouble;
+            _turnKind = kind;
+            _turnFirstAudioLogged = false;
+        }
+
+        private void LogFirstAudioLatency()
+        {
+            if (_turnT0 < 0.0 || _turnFirstAudioLogged) return;
+            _turnFirstAudioLogged = true;
+            double ms = (Time.realtimeSinceStartupAsDouble - _turnT0) * 1000.0;
+            Debug.Log($"[Latency] {_turnKind} turn -> first audio: {ms:F0} ms ({(IsDirectMode ? "direct" : "relay")})");
+        }
+
+        private static void HandleItemAddedDiag(string json)
+        {
+            if (!Debug.isDebugBuild) return;
+            try
+            {
+                var item = JObject.Parse(json)["item"] as JObject;
+                if (item == null) return;
+                var content = item["content"] as JArray;
+                string kind = content != null && content.Count > 0 ? (content[0]["type"]?.ToString() ?? "-") : "-";
+                Debug.Log($"[OpenAI] item.added role={item.Value<string>("role") ?? "-"} type={item.Value<string>("type") ?? "-"} content={kind} id={item.Value<string>("id")}");
+            }
+            catch (Exception)
+            {
+                // diagnostics only
+            }
         }
 
         private static void HandleNoop() { }

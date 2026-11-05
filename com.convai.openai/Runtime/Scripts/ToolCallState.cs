@@ -28,6 +28,17 @@ namespace OpenAI
 			_nameByCallId[callId] = name;
 		}
 
+		public void SetArgsJson(string callId, string json)
+		{
+			if (!string.IsNullOrEmpty(callId)) _argsByCallId[callId] = new StringBuilder(json ?? "{}");
+		}
+
+		public void ClearAll()
+		{
+			_argsByCallId.Clear();
+			_nameByCallId.Clear();
+		}
+
 		public bool TryGetName(string callId, out string name)
 		{
 			return _nameByCallId.TryGetValue(callId, out name);

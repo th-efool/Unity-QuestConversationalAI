@@ -49,6 +49,12 @@ namespace OpenAI.RAG
 
         private OpenAIEmbeddingClient _embeddingClient;
         private IVectorStoreProvider _provider;
+        private RagLocalCache _cache;
+
+        /// <summary>
+        /// Instant in-memory retrieval cache. Null until Register() runs or when the backend cannot be mirrored.
+        /// </summary>
+        public RagLocalCache LocalCache => _cache;
         private bool _isRegistered;
         private string _lastUserTranscript = string.Empty;
         private Coroutine _proactiveDebounceCoroutine;
@@ -147,6 +153,7 @@ namespace OpenAI.RAG
 
             if (_isRegistered) return;
             _isRegistered = true;
+            StartLocalCache();
 
             EnsureInitialized();
 
@@ -191,6 +198,8 @@ namespace OpenAI.RAG
             {
                 _embeddingClient = new OpenAIEmbeddingClient(ragConfig);
                 _provider = VectorProviderFactory.Create(ragConfig);
+                _cache = null;
+                if (_isRegistered) StartLocalCache();
             }
             else
             {
@@ -268,6 +277,7 @@ namespace OpenAI.RAG
             try
             {
                 var results = await SearchAsync(query);
+                results = LimitForTool(results);
                 string formattedContext = FormatContext(results);
 
                 return new JObject
@@ -287,6 +297,52 @@ namespace OpenAI.RAG
                     ["context"] = $"Error searching knowledge base: {ex.Message}"
                 };
             }
+        }
+
+        #endregion
+
+        #region Local Cache (instant retrieval)
+
+        private async void StartLocalCache()
+        {
+            if (ragConfig == null || !ragConfig.enableLocalCache || _cache != null) return;
+
+            EnsureInitialized();
+            if (!(_provider is IBulkExportProvider))
+            {
+                Debug.Log($"[OpenAI.RAG] Local cache is not available for backend {ragConfig.backendType}; using live remote search.");
+                return;
+            }
+
+            var cache = new RagLocalCache(ragConfig);
+            _cache = cache;
+            try
+            {
+                await cache.InitializeAsync(_provider, _embeddingClient);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[OpenAI.RAG] Local cache initialisation failed; using live remote search. {ex.Message}");
+            }
+        }
+
+        private List<RagSearchResult> LimitForTool(List<RagSearchResult> results)
+        {
+            if (results == null) return new List<RagSearchResult>();
+
+            int maxResults = Mathf.Max(1, ragConfig.toolMaxResults);
+            int maxChars = Mathf.Max(100, ragConfig.toolMaxCharsPerChunk);
+            var limited = new List<RagSearchResult>(Mathf.Min(maxResults, results.Count));
+            for (int i = 0; i < results.Count && i < maxResults; i++)
+            {
+                var r = results[i];
+                var c = r.chunk;
+                string text = c != null && c.text != null ? c.text.Trim() : string.Empty;
+                if (text.Length > maxChars) text = text.Substring(0, maxChars).TrimEnd() + "...";
+                var copy = new DocumentChunk(c?.id, c?.documentId, c?.sourceName, c != null ? c.chunkIndex : 0, text, null, c?.metadataJson);
+                limited.Add(new RagSearchResult(copy, r.score));
+            }
+            return limited;
         }
 
         #endregion
@@ -382,6 +438,19 @@ namespace OpenAI.RAG
             EnsureInitialized();
 
             onRagQueryStarted?.Invoke(query);
+
+            if (_cache != null && _cache.IsReady)
+            {
+                var cacheTimer = System.Diagnostics.Stopwatch.StartNew();
+                var (cachedResults, cacheMode) = await _cache.SearchAsync(query, ragConfig.topK, ragConfig.similarityThreshold, _embeddingClient);
+                if (cachedResults != null)
+                {
+                    Debug.Log($"[Latency] RAG '{query}' -> {cachedResults.Count} chunk(s) via local cache ({cacheMode}) in {cacheTimer.ElapsedMilliseconds} ms");
+                    onRagResultsReceived?.Invoke(cachedResults);
+                    onRagContextRetrieved?.Invoke(FormatContext(cachedResults));
+                    return cachedResults;
+                }
+            }
 
             if (_embeddingClient == null)
             {

@@ -3,7 +3,7 @@ using UnityEngine;
 
 /// <summary>
 /// Streams microphone audio as Base64-encoded 16-bit mono PCM chunks.
-/// Each chunk is 1,024 samples (~64 ms at 16 kHz).
+/// Each chunk is 2,400 samples (100 ms at 24 kHz).
 /// </summary>
 public class MicrophoneStreamer : MonoBehaviour
 {
@@ -15,8 +15,8 @@ public class MicrophoneStreamer : MonoBehaviour
     /// </summary>
     public bool IsMuted { get; set; }
 
-    private const int SampleRateOut   = 16_000; 
-    private const int ChunkSamplesOut = 1_024;
+    private const int SampleRateOut   = 24_000;
+    private const int ChunkSamplesOut = 2_400;
 
     private AudioClip _microphoneClip;
     private string _micDevice;

@@ -60,7 +60,7 @@ namespace OpenAI.RAG
                 return (false, uriError);
             }
 
-            string ns = _config != null ? _config.collectionOrTableName : string.Empty;
+            string ns = _config != null ? _config.GetEffectiveCollectionOrTable() : string.Empty;
             var vectorsArray = new JArray();
 
             for (int i = 0; i < chunks.Count; i++)
@@ -177,7 +177,7 @@ namespace OpenAI.RAG
             int effectiveTopK = topK > 0 ? topK : (_config != null ? _config.topK : 3);
             if (effectiveTopK <= 0) effectiveTopK = 3;
 
-            string ns = _config != null ? _config.collectionOrTableName : string.Empty;
+            string ns = _config != null ? _config.GetEffectiveCollectionOrTable() : string.Empty;
 
             var vectorArray = new JArray();
             for (int i = 0; i < queryEmbedding.Length; i++)
@@ -257,7 +257,7 @@ namespace OpenAI.RAG
                 return (false, uriError);
             }
 
-            string ns = _config != null ? _config.collectionOrTableName : string.Empty;
+            string ns = _config != null ? _config.GetEffectiveCollectionOrTable() : string.Empty;
 
             var requestBody = new JObject
             {
@@ -353,7 +353,7 @@ namespace OpenAI.RAG
                     var root = JObject.Parse(responseText);
                     int totalVectors = (int?)root["totalVectorCount"] ?? 0;
                     int dimension = (int?)root["dimension"] ?? 0;
-                    string ns = _config != null ? _config.collectionOrTableName : string.Empty;
+                    string ns = _config != null ? _config.GetEffectiveCollectionOrTable() : string.Empty;
 
                     string nsInfo = string.Empty;
                     if (!string.IsNullOrEmpty(ns) && root["namespaces"] is JObject nsDict && nsDict[ns] is JObject targetNs)
@@ -390,7 +390,7 @@ namespace OpenAI.RAG
         private string ResolveBaseUri(out string error)
         {
             error = null;
-            string uri = _config != null ? _config.databaseUri?.Trim() : null;
+            string uri = _config != null ? _config.GetEffectiveDatabaseUri()?.Trim() : null;
 
             if (string.IsNullOrWhiteSpace(uri))
             {

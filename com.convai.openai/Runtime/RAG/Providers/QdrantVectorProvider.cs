@@ -16,7 +16,7 @@ namespace OpenAI.RAG
     /// Supports automatic collection creation, deterministic UUID point indexing, similarity search,
     /// batch upserting, and collection purging.
     /// </summary>
-    public class QdrantVectorProvider : IVectorStoreProvider
+    public class QdrantVectorProvider : IVectorStoreProvider, IBulkExportProvider
     {
         private const int MaxUpsertBatchSize = 100;
 
@@ -251,7 +251,7 @@ namespace OpenAI.RAG
                             string docId = payload?["document_id"]?.ToString() ?? string.Empty;
                             string sourceName = payload?["source_name"]?.ToString() ?? string.Empty;
                             int chunkIndex = payload?["chunk_index"]?.Value<int>() ?? 0;
-                            string text = payload?["text"]?.ToString() ?? string.Empty;
+                            string text = payload?["text"]?.ToString() ?? payload?["content"]?.ToString() ?? string.Empty;
                             string metadata = payload?["metadata_json"]?.ToString() ?? string.Empty;
 
                             var chunk = new DocumentChunk(chunkId, docId, sourceName, chunkIndex, text, null, metadata);
@@ -544,16 +544,132 @@ namespace OpenAI.RAG
             }
         }
 
+        /// <summary>
+        /// Downloads every point (payload plus embedding vector) from the collection using the Qdrant
+        /// scroll API, so the knowledge base can be mirrored into a local in-memory index.
+        /// Endpoint: POST /collections/{collection}/points/scroll
+        /// </summary>
+        public async Task<(List<DocumentChunk> chunks, string error)> ExportAllAsync(string apiKeyOverride = null)
+        {
+            var all = new List<DocumentChunk>();
+            string baseUri = GetBaseUri();
+            if (string.IsNullOrEmpty(baseUri))
+            {
+                return (all, "Qdrant Database URI is not configured in RagConfig.");
+            }
+
+            string url = $"{baseUri}/collections/{GetCollectionName()}/points/scroll";
+            string apiKey = GetApiKey(apiKeyOverride);
+            JToken offset = null;
+
+            for (int page = 0; page < 400; page++)
+            {
+                var requestBody = new JObject
+                {
+                    ["limit"] = 128,
+                    ["with_payload"] = true,
+                    ["with_vector"] = true
+                };
+                if (offset != null && offset.Type != JTokenType.Null)
+                {
+                    requestBody["offset"] = offset;
+                }
+
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(requestBody.ToString(Formatting.None));
+                string responseText;
+                using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
+                {
+                    request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    ApplyHeaders(request, apiKey);
+                    request.timeout = 60;
+
+                    try
+                    {
+                        await SendWebRequestAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (all, $"Network error during Qdrant export: {ex.Message}");
+                    }
+
+                    responseText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                    if (request.result != UnityWebRequest.Result.Success && request.responseCode != 200)
+                    {
+                        return (all, FormatHttpError(request, request.responseCode, responseText));
+                    }
+                }
+
+                try
+                {
+                    var (pageChunks, next) = await Task.Run(() => ParseScrollPage(responseText));
+                    all.AddRange(pageChunks);
+                    offset = next;
+                }
+                catch (Exception ex)
+                {
+                    return (all, $"Failed to parse Qdrant scroll response: {ex.Message}");
+                }
+
+                if (offset == null || offset.Type == JTokenType.Null)
+                {
+                    break;
+                }
+            }
+
+            return (all, null);
+        }
+
+        private static (List<DocumentChunk> chunks, JToken next) ParseScrollPage(string json)
+        {
+            var chunks = new List<DocumentChunk>();
+            var root = JObject.Parse(json);
+            var result = root["result"] as JObject;
+            var points = result?["points"] as JArray;
+            if (points != null)
+            {
+                foreach (var point in points)
+                {
+                    var payload = point["payload"] as JObject;
+                    string text = payload?["text"]?.ToString() ?? payload?["content"]?.ToString() ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        continue;
+                    }
+
+                    string chunkId = payload?["chunk_id"]?.ToString() ?? point["id"]?.ToString();
+                    string docId = payload?["document_id"]?.ToString() ?? string.Empty;
+                    string sourceName = payload?["source_name"]?.ToString() ?? string.Empty;
+                    int chunkIndex = payload?["chunk_index"]?.Value<int>() ?? 0;
+                    string metadata = payload?["metadata_json"]?.ToString() ?? string.Empty;
+
+                    float[] vector = null;
+                    var vec = point["vector"] as JArray;
+                    if (vec != null && vec.Count > 0)
+                    {
+                        vector = new float[vec.Count];
+                        for (int i = 0; i < vec.Count; i++)
+                        {
+                            vector[i] = (float)vec[i];
+                        }
+                    }
+
+                    chunks.Add(new DocumentChunk(chunkId, docId, sourceName, chunkIndex, text, vector, metadata));
+                }
+            }
+
+            return (chunks, result?["next_page_offset"]);
+        }
+
         private string GetBaseUri()
         {
-            return (_config?.databaseUri ?? string.Empty).Trim().TrimEnd('/');
+            return (_config != null ? _config.GetEffectiveDatabaseUri() : string.Empty).Trim().TrimEnd('/');
         }
 
         private string GetCollectionName()
         {
-            return string.IsNullOrWhiteSpace(_config?.collectionOrTableName)
-                ? "documents"
-                : _config.collectionOrTableName.Trim();
+            string col = _config != null ? _config.GetEffectiveCollectionOrTable() : null;
+            return string.IsNullOrWhiteSpace(col) ? "documents" : col.Trim();
         }
 
         private int GetDimensions()

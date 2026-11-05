@@ -33,6 +33,7 @@ namespace OpenAI
 
     public class InputAudioTranscriptDone : BaseEvent
     {
+        [JsonProperty("transcript")] public string Transcript { get; set; }
         [JsonProperty("text")] public string Text { get; set; }
     }
 
